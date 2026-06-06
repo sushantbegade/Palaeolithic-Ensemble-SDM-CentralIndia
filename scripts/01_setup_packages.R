@@ -26,11 +26,27 @@
 
 set.seed(42)  # Fixed random seed — state in Methods Section 5.15
 
-# Redirect terra temp files to E drive — prevents C drive overflow
-# during heavy raster processing (Scripts 11-22)
+# ── MEMORY AND TEMP MANAGEMENT ──────────────────────────────
+# Redirect all temp to E drive (also set in .Renviron)
 E_TEMP <- "E:/R_temp"
 dir.create(E_TEMP, recursive = TRUE, showWarnings = FALSE)
-terra::terraOptions(tempdir = E_TEMP)
+terra::terraOptions(
+  tempdir = E_TEMP,
+  memmax  = 4        # limit terra RAM use to 4GB — forces
+)                    # chunked processing through E drive
+
+# R temp (works if .Renviron set correctly)
+if (!grepl("^E:", tempdir())) {
+  warning("R tempdir still on C drive — check .Renviron")
+} else {
+  cat("✓ R tempdir on E drive:", tempdir(), "\n")
+}
+
+# Aggressive garbage collection helper — call between heavy ops
+gc_now <- function(label = "") {
+  gc(verbose = FALSE, full = TRUE)
+  if (nchar(label) > 0) cat("  [GC]", label, "\n")
+}
 
 # ── 1. BASE DIRECTORY ───────────────────────────────────────
 # Change ONLY this one path if the project moves to a
