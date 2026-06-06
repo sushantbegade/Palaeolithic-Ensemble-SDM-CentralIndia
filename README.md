@@ -62,7 +62,8 @@ model outputs, and SHAP surfaces are available at:
 **Zenodo DOI:** [INSERT AT SUBMISSION]
 
 Raw data sources:
-- National Geoscience Data Repository (NGDR): geodataindia.gov.in
+- Geological, Geomorphological and Lithological Data: geodataindia.gov.in
+- River and Waterbody Data: indiawris.gov.in
 - Sentinel-2A: bhoonidhi.nrsc.gov.in
 - CHELSA-TraCE21k: chelsa-climate.org/chelsa-trace21k/
 - WorldClim v2.1: worldclim.org
