@@ -6,8 +6,11 @@ Bias Correction, Algorithmic Diversity, and Spatially Heterogeneous
 Predictor Importance
 
 **Author:** Sushant Begade and Prabash Sahu
+
 **Affiliation:** Department of Ancient Indian History, Culture and Archaeology, Rashtrasant Tukadoji Maharaj Nagpur University, Nagpur – 440033, India.   
+
 **ORCID:** Sushant Begade: 0009-0003-0804-1763; Prabash Sahu: 0000-0003-0691-0403
+
 **Target journal:** Journal of Archaeological Science  
 
 ---
