@@ -26,6 +26,12 @@
 
 set.seed(42)  # Fixed random seed — state in Methods Section 5.15
 
+# Redirect terra temp files to E drive — prevents C drive overflow
+# during heavy raster processing (Scripts 11-22)
+E_TEMP <- "E:/R_temp"
+dir.create(E_TEMP, recursive = TRUE, showWarnings = FALSE)
+terra::terraOptions(tempdir = E_TEMP)
+
 # ── 1. BASE DIRECTORY ───────────────────────────────────────
 # Change ONLY this one path if the project moves to a
 # different drive or computer. All other paths update
