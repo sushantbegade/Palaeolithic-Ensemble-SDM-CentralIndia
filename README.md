@@ -64,7 +64,7 @@ model outputs, and SHAP surfaces are available at:
 Raw data sources:
 - Geological, Geomorphological and Lithological Data: geodataindia.gov.in
 - River and Waterbody Data: indiawris.gov.in
-- Sentinel-2A: bhoonidhi.nrsc.gov.in
+- DEM and Sentinel-2A: bhoonidhi.nrsc.gov.in
 - CHELSA-TraCE21k: chelsa-climate.org/chelsa-trace21k/
 - WorldClim v2.1: worldclim.org
 
