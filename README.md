@@ -5,9 +5,9 @@ for Predicting Open-Air Palaeolithic Site Distribution in Central India:
 Bias Correction, Algorithmic Diversity, and Spatially Heterogeneous 
 Predictor Importance
 
-**Author:** Sushant Begade  
+**Author:** Sushant Begade and Prabash Sahu
 **Affiliation:** RTMNU Nagpur  
-**ORCID:** 0009-0003-0804-1763  
+**ORCID:** Sushant Begade: 0009-0003-0804-1763; Prabash Sahu: 0000-0003-0691-0403
 **Target journal:** Journal of Archaeological Science  
 
 ---
