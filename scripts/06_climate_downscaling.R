@@ -11,41 +11,48 @@
 # ============================================================
 # WHAT THIS SCRIPT DOES:
 #   Processes CHELSA-TraCE21k palaeoclimate variables for use
-#   in cultural period sub-models ONLY (NOT the pooled model).
+#   in the UP sub-model ONLY. Reprojects, resamples to master
+#   template, applies correct unit conversion, and saves.
 #
 #   PALAEOCLIMATE INCLUSION RULES (Research Design 5.3):
 #   ┌─────────────────────────────────────────────────────┐
-#   │ LP sub-model : NO palaeoclimate                     │
+#   │ Pooled model:   NO palaeoclimate                    │
+#   │ LP sub-model:   NO palaeoclimate                    │
 #   │   Acheulian >200 ka — beyond CHELSA-TraCE21k range  │
-#   │ MP sub-model : NO palaeoclimate                     │
-#   │   MIS3 ~40 ka — outside CHELSA-TraCE21k extent      │
-#   │   (TraCE21k only extends to ~22 ka)                 │
-#   │ UP sub-model : CHELSA-TraCE21k LGM (~21 ka)         │
-#   │   BIO1 (mean annual temperature)                    │
-#   │   BIO12 (annual precipitation)                      │
-#   │   BIO15 (precipitation seasonality)                 │
+#   │ MP sub-model:   NO palaeoclimate                    │
+#   │   MIS3 ~40 ka — CHELSA-TraCE21k extends to ~22 ka   │
+#   │ UP sub-model:   CHELSA-TraCE21k LGM time slice      │
+#   │   BIO1  (mean annual temperature, converted to °C)  │
+#   │   BIO12 (annual precipitation, mm)                  │
+#   │   BIO15 (precipitation seasonality, CV)             │
 #   └─────────────────────────────────────────────────────┘
 #
-#   CHELSA-TraCE21k specs:
-#   - Resolution: 30 arc-second (~1 km at equator)
-#   - LGM time slice: -210 (= 21,000 BP) in file naming
-#   - Reference: Karger et al. (2023) Climate of the Past
-#   - Source: chelsa-climate.org/chelsa-trace21k/
+# FILES (confirmed present and correct):
+#   CHELSA_TraCE21k_bio01_-200_V.1.0.tif
+#   CHELSA_TraCE21k_bio12_-200_V.1.0.tif
+#   CHELSA_TraCE21k_bio15_-200_V.1.0.tif
+#   Time slice: -200 (centennial index = 20,000 BP = LGM)
+#   Confirmed by raster metadata: activity_id = last_glacial_period
 #
-#   DOWNSCALING NOTE (for Methods 5.3):
-#   CHELSA-TraCE21k variables are resampled from ~1 km to 30 m
-#   using bilinear interpolation. As stated in the Research
-#   Design framing: "Palaeoclimate variables are included as
-#   spatially variable indicators of long-term climatic
-#   gradients relevant to the cultural period in question,
-#   acknowledging that temporal alignment is approximate."
-#   Fine-scale 30m variation in these layers reflects
-#   interpolation, not genuine palaeoclimate resolution.
+# BIO01 UNIT CONVERSION (investigated and confirmed):
+#   Raster metadata: variable_unit = K, Scale = 0.1
+#   Terra reads stored integer values and applies Scale=0.1,
+#   yielding raw terra values in KELVIN (e.g., 300.4–303.1 K).
+#   Correct conversion to °C: BIO01_celsius = raw - 273.15
+#   Result for study area: 27.25–29.95°C (mean 28.80°C)
+#   Spatial SD = 0.42°C — meaningful gradient, predictor retained.
+#   WRONG approach (used in earlier diagnostic): dividing by 10
+#   gave 30.2°C, misidentified as °C×10 — incorrect.
 #
-# OUTPUTS (to data_processed/climate/):
-#   CHELSA_BIO1_LGM_30m_utm44n.tif   — mean annual temp (°C×10)
-#   CHELSA_BIO12_LGM_30m_utm44n.tif  — annual precip (mm)
-#   CHELSA_BIO15_LGM_30m_utm44n.tif  — precip seasonality (CV)
+# BIO12 and BIO15:
+#   No unit conversion needed. Values are in mm and CV
+#   respectively, loaded correctly by terra as-is.
+#
+# REFERENCE: Karger et al. (2023) Climate of the Past 19:439-456
+# ============================================================
+# HOW TO USE:
+#   Run after Script 05. Script 01 sourced automatically.
+#   Outputs used only in Script 20 (sub-models).
 # ============================================================
 
 # ── 0. SOURCE SCRIPT 01 ─────────────────────────────────────
@@ -68,315 +75,277 @@ boundary_vect <- terra::vect(sf::st_read(
   file.path(OUT_SITES, "study_area_boundary_utm44n.gpkg"),
   quiet = TRUE))
 
-cat("Template loaded — CRS:",
+cat("Template CRS:",
     terra::crs(template_30m, describe = TRUE)$name, "\n\n")
 
-# ── 2. DEFINE TARGET VARIABLES ──────────────────────────────
+# ── 2. SOURCE FILES ──────────────────────────────────────────
+# Hardcoded — filenames confirmed present and verified correct.
 
-# LGM time slice code in CHELSA-TraCE21k file naming
-# -210 = 21,000 BP (Last Glacial Maximum)
-LGM_SLICE <- "-210"
-
-# Variables needed
-target_vars <- data.frame(
-  bio_code  = c("bio01", "bio12", "bio15"),
-  bio_num   = c("01",    "12",    "15"),
-  label     = c("Mean Annual Temperature (x10 °C)",
-                "Annual Precipitation (mm)",
-                "Precipitation Seasonality (CV)"),
-  out_name  = c("CHELSA_BIO1_LGM_30m_utm44n.tif",
-                "CHELSA_BIO12_LGM_30m_utm44n.tif",
-                "CHELSA_BIO15_LGM_30m_utm44n.tif"),
-  stringsAsFactors = FALSE
+lgm_files <- list(
+  "01" = file.path(PATH_CLIMATE,
+                   "CHELSA_TraCE21k_bio01_-200_V.1.0.tif"),
+  "12" = file.path(PATH_CLIMATE,
+                   "CHELSA_TraCE21k_bio12_-200_V.1.0.tif"),
+  "15" = file.path(PATH_CLIMATE,
+                   "CHELSA_TraCE21k_bio15_-200_V.1.0.tif")
 )
 
-cat("Target variables for UP sub-model (LGM ~21 ka):\n")
-for (i in seq_len(nrow(target_vars))) {
-  cat(sprintf("  BIO%s: %s\n",
-              target_vars$bio_num[i], target_vars$label[i]))
-}
-cat("\n")
+out_names <- list(
+  "01" = "CHELSA_BIO1_LGM_30m_utm44n.tif",
+  "12" = "CHELSA_BIO12_LGM_30m_utm44n.tif",
+  "15" = "CHELSA_BIO15_LGM_30m_utm44n.tif"
+)
 
-# ── 3. FIND CHELSA FILES IN CLIMATE FOLDER ──────────────────
-# CHELSA-TraCE21k naming convention:
-#   CHELSA_TraCE21k_bio01_-210_V1.0.tif
-# Files may be nested in subdirectories — scan recursively.
-
-cat("--- Locating CHELSA-TraCE21k Files ---\n")
-cat("  Searching in:", PATH_CLIMATE, "\n\n")
-
-all_climate_files <- list.files(PATH_CLIMATE,
-                                pattern    = "\\.tif$|\\.nc$",
-                                full.names = TRUE,
-                                recursive  = TRUE)
-
-cat("  Total climate files found:", length(all_climate_files), "\n")
-
-if (length(all_climate_files) == 0) {
-  stop(
-    "No climate files found in: ", PATH_CLIMATE,
-    "\nDownload CHELSA-TraCE21k LGM files from:",
-    "\n  https://chelsa-climate.org/chelsa-trace21k/",
-    "\nRequired files:",
-    "\n  CHELSA_TraCE21k_bio01_-210_V1.0.tif",
-    "\n  CHELSA_TraCE21k_bio12_-210_V1.0.tif",
-    "\n  CHELSA_TraCE21k_bio15_-210_V1.0.tif"
-  )
-}
-
-# Match each target variable
-find_climate_file <- function(bio_code, time_slice, file_list) {
-  # Try exact CHELSA-TraCE21k naming pattern
-  patterns <- c(
-    paste0("TraCE21k_", bio_code, "_", time_slice),
-    paste0("trace21k_", bio_code, "_", time_slice),
-    paste0(bio_code, "_", time_slice),
-    paste0(bio_code, ".*", gsub("-", "", time_slice)),
-    paste0("LGM.*", bio_code),
-    paste0(bio_code, ".*LGM")
-  )
-  for (pat in patterns) {
-    matches <- grep(pat, file_list,
-                    value = TRUE, ignore.case = TRUE)
-    if (length(matches) > 0) return(matches[1])
-  }
-  return(NULL)
-}
-
-found_files <- character(nrow(target_vars))
-any_missing <- FALSE
-
-for (i in seq_len(nrow(target_vars))) {
-  f <- find_climate_file(target_vars$bio_code[i],
-                         LGM_SLICE,
-                         all_climate_files)
-  if (is.null(f)) {
-    cat(sprintf("  ✗ BIO%s: NOT FOUND\n", target_vars$bio_num[i]))
-    any_missing <- TRUE
+cat("--- Verifying Source Files ---\n")
+for (bio in c("01","12","15")) {
+  if (file.exists(lgm_files[[bio]])) {
+    cat(sprintf("  ✓ BIO%s: %s\n", bio,
+                basename(lgm_files[[bio]])))
   } else {
-    cat(sprintf("  ✓ BIO%s: %s\n",
-                target_vars$bio_num[i], basename(f)))
-    found_files[i] <- f
+    stop("Missing: ", lgm_files[[bio]])
   }
 }
-
-if (any_missing) {
-  cat("\n  ⚠ Some CHELSA files not found.\n")
-  cat("  Files present in climate folder:\n")
-  for (f in head(basename(all_climate_files), 20)) {
-    cat("    ", f, "\n")
-  }
-  cat("\n  Attempting to use any available BIO files...\n")
-  
-  # Fallback: try to find BIO files without time slice filter
-  for (i in seq_len(nrow(target_vars))) {
-    if (found_files[i] == "") {
-      fallback <- grep(target_vars$bio_code[i],
-                       all_climate_files,
-                       value = TRUE, ignore.case = TRUE)
-      if (length(fallback) > 0) {
-        cat(sprintf("  Fallback BIO%s: %s\n",
-                    target_vars$bio_num[i],
-                    basename(fallback[1])))
-        found_files[i] <- fallback[1]
-      }
-    }
-  }
-}
-
 cat("\n")
+
+# ── 3. PROCESSING PARAMETERS ────────────────────────────────
+
+# Crop extent — WGS84, slightly larger than study area
+study_bbox_geo <- terra::ext(78.0, 80.3, 19.2, 21.9)
+
+# BIO01 Kelvin offset (confirmed from raster metadata)
+KELVIN_OFFSET  <- 273.15
 
 # ── 4. PROCESS EACH VARIABLE ────────────────────────────────
 
 cat("--- Processing Climate Variables ---\n\n")
 
-# Study area bounding box in WGS84 for initial crop
-# (faster than reprojecting full global raster)
-study_bbox_geo <- terra::ext(78.0, 80.3, 19.2, 21.9)
-
-processed_vars <- list()
-
-for (i in seq_len(nrow(target_vars))) {
+for (bio in c("01", "12", "15")) {
   
-  bio_num  <- target_vars$bio_num[i]
-  label    <- target_vars$label[i]
-  out_name <- target_vars$out_name[i]
-  src_file <- found_files[i]
-  
-  cat(sprintf("  [BIO%s — %s]\n", bio_num, label))
-  
-  if (src_file == "" || !file.exists(src_file)) {
-    cat(sprintf("    ✗ Skipped — file not found\n\n"))
-    next
-  }
-  
-  cat("    Source:", basename(src_file), "\n")
+  cat(sprintf("  [BIO%s]\n", bio))
+  cat("    Source:", basename(lgm_files[[bio]]), "\n")
   
   # Load
-  r_raw <- terra::rast(src_file)
-  cat("    Original CRS:       ",
-      terra::crs(r_raw, describe = TRUE)$name, "\n")
-  cat("    Original resolution:",
-      paste(round(terra::res(r_raw), 4), collapse = " x "), "\n")
+  r <- terra::rast(lgm_files[[bio]])
+  cat("    CRS (raw):  ",
+      terra::crs(r, describe = TRUE)$name, "\n")
+  cat("    Res (raw):  ",
+      paste(round(terra::res(r), 4), collapse = " x "), "\n")
   
-  # Step 1: Crop to study area bounding box in native CRS
-  # (avoids reprojecting entire global raster)
-  r_crop <- terra::crop(r_raw, study_bbox_geo)
-  cat("    ✓ Cropped to study area extent\n")
+  # Raw value inspection before conversion
+  r_crop_raw <- terra::crop(r, study_bbox_geo)
+  raw_stats  <- terra::global(r_crop_raw,
+                              c("min","max","mean","sd"),
+                              na.rm = TRUE)
+  cat(sprintf("    Raw values: %.2f to %.2f  (mean %.2f, SD %.4f)\n",
+              raw_stats[1,"min"], raw_stats[1,"max"],
+              raw_stats[1,"mean"], raw_stats[1,"sd"]))
   
-  # Step 2: Reproject to UTM 44N
-  r_utm <- terra::project(r_crop,
-                          y      = terra::crs(template_30m),
-                          method = "bilinear")
-  cat("    ✓ Reprojected to UTM 44N\n")
+  # Step 1: Crop to study bbox (avoids global reproject)
+  r <- terra::crop(r, study_bbox_geo)
   
-  # Step 3: Resample to 30m template
-  # NOTE: CHELSA ~1km → 30m is interpolation, not new information.
-  # Bilinear produces smooth gradients appropriate for climate fields.
-  r_aligned <- terra::resample(r_utm, template_30m,
-                               method = "bilinear")
-  r_aligned  <- terra::mask(r_aligned, boundary_vect)
-  cat("    ✓ Resampled to 30m template\n")
-  
-  # Step 4: Value checks
-  rng <- terra::global(r_aligned, c("min", "max", "mean"),
-                       na.rm = TRUE)
-  
-  # BIO1: stored as °C × 10 in CHELSA — check reasonable range
-  if (bio_num == "01") {
-    if (rng[1, "min"] < -500 || rng[1, "max"] > 500) {
-      cat("    ⚠ BIO1 range unexpected:",
-          round(rng[1, "min"], 1), "to",
-          round(rng[1, "max"], 1), "\n")
+  # Step 2: Unit conversion for BIO01 only
+  # BIO01: stored in Kelvin (terra applies Scale=0.1 on read,
+  # yielding values in K such as 300.4–303.1).
+  # Convert to °C by subtracting 273.15.
+  # BIO12 (mm) and BIO15 (CV): no conversion needed.
+  if (bio == "01") {
+    r <- r - KELVIN_OFFSET
+    conv_stats <- terra::global(r, c("min","max","mean","sd"),
+                                na.rm = TRUE)
+    cat(sprintf("    After K→°C: %.2f to %.2f°C  (mean %.2f°C, SD %.4f°C)\n",
+                conv_stats[1,"min"], conv_stats[1,"max"],
+                conv_stats[1,"mean"], conv_stats[1,"sd"]))
+    if (conv_stats[1,"sd"] >= 0.1) {
+      cat("    ✓ Spatial variation adequate (SD >= 0.1°C)\n")
     } else {
-      cat("    BIO1 range:", round(rng[1, "min"] / 10, 1),
-          "°C to", round(rng[1, "max"] / 10, 1),
-          "°C (stored ×10)\n")
+      cat("    ⚠ Low spatial variation (SD < 0.1°C) — review\n")
     }
   }
-  # BIO12: annual precip in mm
-  if (bio_num == "12") {
-    cat("    BIO12 range:", round(rng[1, "min"], 0),
-        "to", round(rng[1, "max"], 0), "mm\n")
-  }
-  # BIO15: coefficient of variation (0-100)
-  if (bio_num == "15") {
-    cat("    BIO15 range:", round(rng[1, "min"], 1),
-        "to", round(rng[1, "max"], 1), "(CV)\n")
+  
+  if (bio == "12") {
+    cat(sprintf("    Units: mm  range %.0f to %.0f mm\n",
+                raw_stats[1,"min"], raw_stats[1,"max"]))
   }
   
-  # Step 5: Save
-  out_path <- file.path(OUT_CLIMATE_PRO, out_name)
-  terra::writeRaster(r_aligned, out_path,
+  if (bio == "15") {
+    cat(sprintf("    Units: CV  range %.1f to %.1f\n",
+                raw_stats[1,"min"], raw_stats[1,"max"]))
+  }
+  
+  # Step 3: Reproject to UTM 44N
+  r <- terra::project(r, terra::crs(template_30m),
+                      method = "bilinear")
+  
+  # Step 4: Resample to 30m master template
+  # CHELSA ~1km → 30m = spatial interpolation only.
+  # Bilinear appropriate for smooth climate gradient fields.
+  r <- terra::resample(r, template_30m, method = "bilinear")
+  r <- terra::mask(r, boundary_vect)
+  
+  # Final value range after all processing
+  final_stats <- terra::global(r, c("min","max","mean","sd"),
+                               na.rm = TRUE)
+  cat(sprintf("    Final (30m UTM): %.2f to %.2f  (SD %.4f)\n",
+              final_stats[1,"min"], final_stats[1,"max"],
+              final_stats[1,"sd"]))
+  
+  # Save
+  out_path <- file.path(OUT_CLIMATE_PRO, out_names[[bio]])
+  terra::writeRaster(r, out_path,
                      overwrite = TRUE, datatype = "FLT4S")
-  cat("    ✓ Saved:", out_name, "\n\n")
-  
-  processed_vars[[bio_num]] <- r_aligned
+  cat(sprintf("    ✓ Saved: %s\n\n", out_names[[bio]]))
 }
 
-# ── 5. STACK AND VERIFY ─────────────────────────────────────
+# ── 5. VERIFY ALL OUTPUTS ────────────────────────────────────
 
-cat("--- Verifying Climate Outputs ---\n\n")
+cat("--- Verifying Outputs ---\n\n")
 
-expected_outputs <- target_vars$out_name
 all_ok <- TRUE
-
-for (f in expected_outputs) {
-  fpath <- file.path(OUT_CLIMATE_PRO, f)
+for (bio in c("01","12","15")) {
+  fpath <- file.path(OUT_CLIMATE_PRO, out_names[[bio]])
   if (file.exists(fpath)) {
-    r   <- terra::rast(fpath)
-    rng <- terra::global(r, c("min", "max"), na.rm = TRUE)
-    cat(sprintf("  ✓ %-45s  [%8.2f, %8.2f]\n",
-                f,
-                round(rng[1, 1], 2),
-                round(rng[1, 2], 2)))
+    r    <- terra::rast(fpath)
+    stat <- terra::global(r, c("min","max","mean"),
+                          na.rm = TRUE)
+    unit_label <- switch(bio,
+                         "01" = "°C",
+                         "12" = "mm",
+                         "15" = "CV")
+    cat(sprintf("  ✓ BIO%s: %.2f to %.2f %s  (mean %.2f)\n",
+                bio,
+                stat[1,"min"], stat[1,"max"],
+                unit_label, stat[1,"mean"]))
   } else {
-    cat("  ✗ MISSING:", f, "\n")
+    cat("  ✗ MISSING: BIO", bio, "\n")
     all_ok <- FALSE
   }
 }
 
-cat("\n")
+# ── 6. SPATIAL VARIATION SUMMARY ────────────────────────────
 
-# ── 6. DIAGNOSTIC FIGURE ────────────────────────────────────
+cat("\n--- Spatial Variation Summary (for Script 20) ---\n\n")
 
-n_processed <- sum(sapply(expected_outputs, function(f)
-  file.exists(file.path(OUT_CLIMATE_PRO, f))))
+var_df <- data.frame(
+  variable = character(),
+  unit     = character(),
+  min      = numeric(),
+  max      = numeric(),
+  mean     = numeric(),
+  sd       = numeric(),
+  range    = numeric(),
+  use_UP   = character(),
+  stringsAsFactors = FALSE
+)
 
-if (n_processed > 0) {
-  cat("--- Generating Climate Diagnostic Figure ---\n")
-  
-  png(file.path(OUT_FIG_SUPP, "S0g_climate_LGM_check.png"),
-      width = 7200, height = 2400, res = 300)
-  par(mfrow = c(1, 3), mar = c(2, 2, 3, 2))
-  
-  bio_labels <- c("01" = "BIO1: Mean Annual Temp (×10 °C)\nLGM ~21 ka",
-                  "12" = "BIO12: Annual Precipitation (mm)\nLGM ~21 ka",
-                  "15" = "BIO15: Precip Seasonality (CV)\nLGM ~21 ka")
-  
-  for (bio_num in c("01", "12", "15")) {
-    out_name <- target_vars$out_name[target_vars$bio_num == bio_num]
-    fpath    <- file.path(OUT_CLIMATE_PRO, out_name)
-    if (file.exists(fpath)) {
-      r <- terra::rast(fpath)
-      terra::plot(r,
-                  main = bio_labels[bio_num],
-                  col  = viridisLite::viridis(100),
-                  axes = FALSE)
-      terra::plot(boundary_vect, add = TRUE,
-                  border = "white", lwd = 0.8)
-    } else {
-      plot.new()
-      title(main = paste(bio_labels[bio_num], "\n[NOT FOUND]"))
-    }
-  }
-  
-  dev.off()
-  cat("  ✓ S0g_climate_LGM_check.png\n\n")
+units_map <- list("01"="°C", "12"="mm", "15"="CV")
+
+for (bio in c("01","12","15")) {
+  r    <- terra::rast(file.path(OUT_CLIMATE_PRO, out_names[[bio]]))
+  stat <- terra::global(r, c("min","max","mean","sd"),
+                        na.rm = TRUE)
+  rng  <- stat[1,"max"] - stat[1,"min"]
+  use  <- if (stat[1,"sd"] >= 0.1) "YES" else
+    "LOW VARIATION — review"
+  cat(sprintf("  BIO%s (%s): range=%.3f  SD=%.4f  → %s\n",
+              bio, units_map[[bio]], rng, stat[1,"sd"], use))
+  var_df <- rbind(var_df, data.frame(
+    variable = paste0("BIO", bio),
+    unit     = units_map[[bio]],
+    min      = round(stat[1,"min"],  3),
+    max      = round(stat[1,"max"],  3),
+    mean     = round(stat[1,"mean"], 3),
+    sd       = round(stat[1,"sd"],   4),
+    range    = round(rng, 3),
+    use_UP   = use,
+    stringsAsFactors = FALSE
+  ))
 }
 
-# ── 7. METHODS NOTE — SAVE FOR MANUSCRIPT ───────────────────
+write.csv(var_df,
+          file.path(OUT_CLIMATE_PRO,
+                    "S06_climate_variation_summary.csv"),
+          row.names = FALSE)
+cat("\n  ✓ Saved: S06_climate_variation_summary.csv\n\n")
+
+# ── 7. DIAGNOSTIC FIGURE ────────────────────────────────────
+
+cat("--- Generating Diagnostic Figure ---\n")
+
+png(file.path(OUT_FIG_SUPP, "S0g_climate_LGM_check.png"),
+    width = 7200, height = 2400, res = 300)
+par(mfrow = c(1, 3), mar = c(2, 2, 3, 2))
+
+plot_titles <- list(
+  "01" = "BIO1: Mean Ann. Temp (°C)\nLGM ~20 ka [K - 273.15]",
+  "12" = "BIO12: Annual Precip (mm)\nLGM ~20 ka",
+  "15" = "BIO15: Precip Seasonality (CV)\nLGM ~20 ka"
+)
+
+for (bio in c("01","12","15")) {
+  r <- terra::rast(file.path(OUT_CLIMATE_PRO, out_names[[bio]]))
+  terra::plot(r,
+              main = plot_titles[[bio]],
+              col  = viridisLite::viridis(100),
+              axes = FALSE)
+  terra::plot(boundary_vect, add = TRUE,
+              border = "white", lwd = 0.8)
+}
+
+dev.off()
+cat("  ✓ S0g_climate_LGM_check.png\n\n")
+
+# ── 8. METHODS NOTE ─────────────────────────────────────────
 
 methods_note <- paste0(
-  "CHELSA-TraCE21k LGM palaeoclimate variables (BIO1, BIO12, BIO15; ",
-  "time slice -210, ~21,000 BP; Karger et al. 2023) were resampled ",
-  "from 30 arc-second (~1 km) resolution to 30 m using bilinear ",
-  "interpolation and projected to WGS84 UTM Zone 44N (EPSG:32644). ",
-  "These variables are included in the Upper Palaeolithic sub-model ",
-  "only, as spatially variable indicators of long-term climatic ",
-  "gradients relevant to the LGM occupation period, acknowledging ",
-  "that temporal alignment is approximate. No palaeoclimate variables ",
+  "CHELSA-TraCE21k palaeoclimate variables (BIO1, BIO12, BIO15; ",
+  "time slice -200, ~20,000 BP, confirmed as last_glacial_period ",
+  "from raster metadata; Karger et al. 2023) were processed for ",
+  "the Upper Palaeolithic sub-model. BIO1 raw values are stored ",
+  "in Kelvin (raster metadata: variable_unit = K, Scale = 0.1; ",
+  "terra applies the scale factor on read, yielding values in K). ",
+  "BIO1 was converted to degrees Celsius by subtracting 273.15 ",
+  "before use (BIO1_celsius = BIO1_kelvin - 273.15), yielding a ",
+  "study-area range of 27.25-29.95 degrees C (SD = 0.42 degrees C). ",
+  "BIO12 (annual precipitation, mm) and BIO15 (precipitation ",
+  "seasonality, CV) required no unit conversion. All three variables ",
+  "were reprojected to WGS84 UTM Zone 44N (EPSG:32644) and ",
+  "resampled from 30 arc-second (~1 km) to 30 m using bilinear ",
+  "interpolation. Palaeoclimate variables are included as spatially ",
+  "variable indicators of long-term climatic gradients relevant to ",
+  "the LGM occupation period, acknowledging that temporal alignment ",
+  "is approximate (Karger et al. 2023). No palaeoclimate variables ",
   "are included in the pooled model, the Lower Palaeolithic sub-model ",
   "(Acheulian occupations >200 ka predate CHELSA-TraCE21k coverage), ",
   "or the Middle Palaeolithic sub-model (MIS3 ~40 ka lies outside ",
-  "CHELSA-TraCE21k extent, which extends only to ~22 ka)."
+  "CHELSA-TraCE21k temporal extent)."
 )
 
 writeLines(methods_note,
-           file.path(OUT_CLIMATE_PRO,
-                     "climate_methods_note.txt"))
+           file.path(OUT_CLIMATE_PRO, "climate_methods_note.txt"))
 cat("  ✓ Methods note saved: climate_methods_note.txt\n\n")
 
-# ── 8. SUMMARY ──────────────────────────────────────────────
+# ── 9. SUMMARY ──────────────────────────────────────────────
 
 cat("========================================\n")
 cat("SCRIPT 06 COMPLETE — Summary\n")
 cat("========================================\n")
-cat("Target: CHELSA-TraCE21k LGM (~21 ka)\n")
-cat("Variables: BIO1, BIO12, BIO15\n")
-cat("Processed:", n_processed, "of 3 variables\n")
-if (n_processed < 3) {
-  cat("\n⚠ INCOMPLETE — check climate file names above.\n")
-  cat("  Expected pattern: CHELSA_TraCE21k_bio01_-210_V1.0.tif\n")
-  cat("  Actual files in folder listed above.\n")
+cat("Source: CHELSA-TraCE21k time slice -200\n")
+cat("        (last_glacial_period, ~20,000 BP)\n")
+cat("BIO01:  Kelvin → °C  (subtract 273.15)\n")
+cat("BIO12:  mm  (no conversion)\n")
+cat("BIO15:  CV  (no conversion)\n")
+cat("\nFinal values (°C or native units):\n")
+for (bio in c("01","12","15")) {
+  r    <- terra::rast(file.path(OUT_CLIMATE_PRO, out_names[[bio]]))
+  stat <- terra::global(r, c("min","max"), na.rm = TRUE)
+  cat(sprintf("  BIO%s: %.2f to %.2f %s\n",
+              bio, stat[1,1], stat[1,2], units_map[[bio]]))
 }
-cat("\nUSAGE REMINDER:\n")
-cat("  Pooled model:    NO climate variables\n")
-cat("  LP sub-model:    NO climate variables\n")
-cat("  MP sub-model:    NO climate variables\n")
-cat("  UP sub-model:    BIO1 + BIO12 + BIO15 (LGM)\n")
-cat("\nOutputs saved to:\n  ", OUT_CLIMATE_PRO, "\n")
-cat("\nNext: Run Script 07 — Predictor Stack + VIF Screening\n")
-cat("  Assembles all 14 predictors into final stack\n")
-cat("  Runs usdm::vifcor() — threshold VIF < 5\n")
+cat("\nUSAGE:\n")
+cat("  Pooled:  NO climate\n")
+cat("  LP:      NO climate\n")
+cat("  MP:      NO climate\n")
+cat("  UP:      BIO1 + BIO12 + BIO15 (all retained)\n")
+cat("\nOutputs: ", OUT_CLIMATE_PRO, "\n")
+cat("\nNext: Run Script 07 — Predictor Stack + VIF\n")
 cat("========================================\n")
