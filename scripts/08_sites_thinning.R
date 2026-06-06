@@ -11,41 +11,48 @@
 # ============================================================
 # WHAT THIS SCRIPT DOES:
 #   Applies spatial thinning (spThin, 1km minimum distance)
-#   to reduce spatial autocorrelation bias in the site
-#   occurrence dataset. Thinning applied:
+#   to reduce spatial autocorrelation bias. Thinning applied:
 #     (a) Pooled dataset — all 197 sites
-#     (b) LP pool (sites with LP attribution)
-#     (c) MP pool (sites with MP attribution)
-#     (d) UP pool (sites with UP attribution)
-#   Each thinned independently; cultural period pools include
-#   all sites attributed to that period (including multi-period
-#   sites, e.g., LP+MP counted in both LP and MP pools).
+#     (b) LP pool — all sites with LP-equivalent attribution
+#     (c) MP pool — all sites with MP-equivalent attribution
+#     (d) UP pool — all sites with UP-equivalent attribution
+#   Multi-period sites counted in each applicable period pool.
 #
 #   Sub-model decision rule applied post-thinning:
-#     N >= 40 thinned: all 6 algorithms
-#     N = 25-39:       MaxEnt + RF + GAM only
-#     N < 25:          sub-model not viable
+#     N >= 40:   all 6 algorithms
+#     N = 25-39: MaxEnt + RF + GAM only
+#     N < 25:    sub-model not viable
 #
-#   Attribution uncertainty sensitivity analysis (Supp S3):
+#   Attribution sensitivity analysis (Supp S3):
 #     Stage 1: CONFIRMED sites only per period
 #     Stage 2: CONFIRMED + PROBABLE sites per period
-#   Both thinned and saved for use in Script 20.
 #
-# INPUTS:
-#   sites_all_utm44n.gpkg — 197 sites (from Script 02)
-#   Excel: columns include Cultural Attribution,
-#          Relative Chronology, Location Precision
+# ATTRIBUTION CLASSIFICATION (India-specific terminology):
+#   LP: Lower Palaeolithic, Acheulian/Acheulean, Series I,
+#       Early Stone Age, Abbevilleo, Palaeoliths (standalone)
+#       NOTE: "Palaeolith" alone is too broad — use word
+#       boundary \\bPalaeoliths\\b to avoid matching
+#       "Upper Palaeolithic", "Middle Palaeolithic" etc.
+#   MP: Middle Palaeolithic, Middle Stone Age, Series II,
+#       MSA, Early Middle, Late Middle, Late Palaeolithic
+#       NOTE: "Late Palaeolithic" in Indian context = Late MP
+#   UP: Upper Palaeolithic, Late Stone Age, Late Palaeolithic,
+#       LSA, Blade and Burin, Microlithic
+#       NOTE: "Late Palaeolithic" is in BOTH MP and UP pools
+#             (transitional — counted in both)
 #
-# OUTPUTS (to data_processed/sites/):
-#   sites_thinned_pooled.gpkg
-#   sites_thinned_LP.gpkg
-#   sites_thinned_MP.gpkg
-#   sites_thinned_UP.gpkg
-#   sites_thinned_LP_confirmed.gpkg    (sensitivity Stage 1)
-#   sites_thinned_MP_confirmed.gpkg
-#   sites_thinned_LP_conf_prob.gpkg    (sensitivity Stage 2)
-#   sites_thinned_MP_conf_prob.gpkg
-#   Table1_site_counts.csv
+# FIXES FROM v1 (06 June 2026):
+#   - LP regex: removed "Palaeolith" (caught "Upper Palaeolithic",
+#     "Middle Palaeolithic" etc.). Replaced with
+#     \\bPalaeoliths\\b (exact word — standalone term only).
+#   - MP regex: added "Late Palaeolithic" (Indian Late MP
+#     terminology — undercount fixed from 86 to ~114).
+#   - Attribution column auto-detection updated for dot-encoded
+#     field names (sf reads spaces as dots from geopackage).
+#   - Confidence classification updated for your exact values:
+#     "Exact ±5-10 m (Field Verified)" and
+#     "Exact ±5-10 m (Reported By Referenced Author)" = confirmed
+#     "GIS Map Based" = uncertain (not confirmed or probable)
 # ============================================================
 
 # ── 0. SOURCE SCRIPT 01 ─────────────────────────────────────
@@ -71,81 +78,140 @@ cat("--- Loading Site Data ---\n")
 sites_sf <- sf::st_read(file.path(OUT_SITES,
                                   "sites_all_utm44n.gpkg"),
                         quiet = TRUE)
-cat("  Total sites loaded:", nrow(sites_sf), "\n")
-cat("  Fields:", paste(names(sites_sf)[
-  !names(sites_sf) %in% c("geom","geometry")],
-  collapse=", "), "\n\n")
+cat("  Total sites loaded:", nrow(sites_sf), "\n\n")
 
-# Extract WGS84 coordinates for spThin (requires lat/lon)
-sites_geo <- sf::st_transform(sites_sf, crs = 4326)
-coords    <- sf::st_coordinates(sites_geo)
-sites_df  <- as.data.frame(sf::st_drop_geometry(sites_sf))
-sites_df$Longitude_WGS84 <- coords[, 1]
-sites_df$Latitude_WGS84  <- coords[, 2]
-sites_df$UTM_X <- sf::st_coordinates(sites_sf)[, 1]
-sites_df$UTM_Y <- sf::st_coordinates(sites_sf)[, 2]
+sites_df <- as.data.frame(sf::st_drop_geometry(sites_sf))
 
-# ── 2. IDENTIFY KEY COLUMNS ─────────────────────────────────
-# Auto-detect cultural attribution and confidence columns
+# UTM coordinates (for saving back to sf)
+coords_utm <- sf::st_coordinates(sites_sf)
+sites_df$UTM_X <- coords_utm[, 1]
+sites_df$UTM_Y <- coords_utm[, 2]
 
-cat("--- Detecting Attribute Columns ---\n")
+# WGS84 coordinates (required by spThin)
+sites_geo  <- sf::st_transform(sites_sf, crs = 4326)
+coords_geo <- sf::st_coordinates(sites_geo)
+sites_df$Longitude_WGS84 <- coords_geo[, 1]
+sites_df$Latitude_WGS84  <- coords_geo[, 2]
 
-all_cols <- names(sites_df)
+# ── 2. CULTURAL ATTRIBUTION ──────────────────────────────────
+# Column name is "Cultural.Attribution" (sf converts spaces to dots)
 
-# Cultural attribution column
-cult_col_candidates <- c("Cultural Attribution",
-                         "cultural_attribution",
-                         "Cultural.Attribution",
-                         "Relative Chronology",
-                         "relative_chronology",
-                         "Culture", "Period", "culture",
-                         "period", "attribution")
-cult_col <- NULL
-for (cand in cult_col_candidates) {
-  if (cand %in% all_cols) { cult_col <- cand; break }
+cat("--- Cultural Period Classification ---\n\n")
+
+cult_str <- as.character(sites_df$Cultural.Attribution)
+
+# ── LP: Lower Palaeolithic equivalent ────────────────────────
+# CRITICAL FIX: use \\bPalaeoliths\\b NOT "Palaeolith"
+# "Palaeolith" matches "Upper Palaeolithic", "Middle Palaeolithic" etc.
+# \\bPalaeoliths\\b matches only the standalone term "Palaeoliths"
+
+is_LP <- grepl(
+  paste("Lower Palaeolithic",
+        "Lower palaeolithic",
+        "\\bLower\\b",
+        "Acheulian",
+        "Acheulean",
+        "Abbevilleo",
+        "\\bSeries I\\b",
+        "Early Stone Age",
+        "\\bESA\\b",
+        "\\bPalaeoliths\\b",
+        sep = "|"),
+  cult_str,
+  ignore.case = FALSE  # case-sensitive — avoids false matches
+)
+# Also catch lowercase "lower" in compound attributions
+is_LP <- is_LP | grepl("lower palaeolithic|lower and|lower,",
+                       cult_str, ignore.case = TRUE)
+
+# ── MP: Middle Palaeolithic equivalent ───────────────────────
+# CRITICAL FIX: add "Late Palaeolithic" — in Indian Palaeolithic
+# literature this refers to the Late Middle Palaeolithic phase.
+# It appears in compound attributions with "Late Middle Palaeolithic"
+# and as a standalone term for the MP-UP transitional phase.
+
+is_MP <- grepl(
+  paste("Middle Palaeolithic",
+        "Middle Stone Age",
+        "Series II",
+        "\\bMSA\\b",
+        "Early Middle",
+        "Late Middle",
+        "Late Palaeolithic",
+        sep = "|"),
+  cult_str,
+  ignore.case = TRUE
+)
+
+# ── UP: Upper Palaeolithic equivalent ────────────────────────
+# Late Palaeolithic also in UP pool (transitional — in both MP and UP)
+
+is_UP <- grepl(
+  paste("Upper Palaeolithic",
+        "Late Stone Age",
+        "Late Palaeolithic",
+        "\\bLSA\\b",
+        "Blade and Burin",
+        "Microlithic",
+        sep = "|"),
+  cult_str,
+  ignore.case = TRUE
+)
+
+# Report pools
+cat(sprintf("  LP pool: %d sites\n", sum(is_LP)))
+cat(sprintf("  MP pool: %d sites\n", sum(is_MP)))
+cat(sprintf("  UP pool: %d sites\n", sum(is_UP)))
+cat(sprintf("  Pooled:  %d sites\n\n", nrow(sites_df)))
+
+# Report unclassified sites
+unclassified <- !is_LP & !is_MP & !is_UP
+if (any(unclassified)) {
+  cat("  Unclassified (in pooled model only):\n")
+  for (v in sort(unique(cult_str[unclassified]))) {
+    cat("    -", v, "\n")
+  }
+  cat("\n")
 }
-if (is.null(cult_col)) {
-  # Try partial match
-  cult_col <- all_cols[grepl("cultur|chrono|period|attrib",
-                             all_cols, ignore.case = TRUE)][1]
-}
-cat("  Cultural attribution column:", cult_col, "\n")
-cat("  Unique values:\n")
-cult_vals <- sort(unique(as.character(sites_df[[cult_col]])))
-for (v in cult_vals) cat("    -", v, "\n")
 
-# Location precision / confidence column
-prec_col_candidates <- c("Location Precision",
-                         "location_precision",
-                         "Location.Precision",
-                         "Attribution Confidence",
-                         "Confidence", "confidence",
-                         "precision", "accuracy")
-prec_col <- NULL
-for (cand in prec_col_candidates) {
-  if (cand %in% all_cols) { prec_col <- cand; break }
-}
-if (is.null(prec_col)) {
-  prec_col <- all_cols[grepl("precis|confid|accur|quality",
-                             all_cols, ignore.case = TRUE)][1]
-}
-cat("\n  Precision/confidence column:", prec_col, "\n")
-if (!is.null(prec_col) && !is.na(prec_col)) {
-  prec_vals <- sort(unique(as.character(sites_df[[prec_col]])))
-  for (v in prec_vals) cat("    -", v, "\n")
-}
+# Validate LP values captured
+cat("  LP attribution values:\n")
+for (v in sort(unique(cult_str[is_LP]))) cat("    +", v, "\n")
+cat("\n  MP attribution values:\n")
+for (v in sort(unique(cult_str[is_MP]))) cat("    +", v, "\n")
+cat("\n  UP attribution values:\n")
+for (v in sort(unique(cult_str[is_UP]))) cat("    +", v, "\n")
 cat("\n")
 
-# ── 3. THINNING HELPER ───────────────────────────────────────
+# ── 3. CONFIDENCE CLASSIFICATION ────────────────────────────
+# From Location.Precision column (confirmed values in your data):
+#   "Exact ±5-10 m (Field Verified)"               → confirmed
+#   "Exact ±5-10 m (Reported By Referenced Author)" → confirmed
+#   "GIS Map Based"                                 → uncertain
+
+cat("--- Confidence Classification ---\n\n")
+
+prec_str <- as.character(sites_df$Location.Precision)
+
+is_confirmed <- grepl("Field Verified|Reported By Referenced",
+                      prec_str, ignore.case = TRUE)
+is_probable  <- rep(FALSE, nrow(sites_df))  # no probable tier in your data
+is_uncertain <- grepl("GIS Map Based", prec_str, ignore.case = TRUE)
+
+cat(sprintf("  Confirmed (GPS ±5-10m): %d sites\n",  sum(is_confirmed)))
+cat(sprintf("  Uncertain (GIS-based):  %d sites\n",  sum(is_uncertain)))
+cat(sprintf("  Other:                  %d sites\n\n",
+            sum(!is_confirmed & !is_uncertain)))
+
+# ── 4. THINNING HELPER ───────────────────────────────────────
 
 thin_sites <- function(df, label, thin_dist_km = THIN_DIST_KM) {
   
-  if (nrow(df) == 0) {
-    cat(sprintf("  [%s] 0 sites — skipping\n", label))
+  if (is.null(df) || nrow(df) == 0) {
+    cat(sprintf("  [%-22s] 0 sites — skipping\n", label))
     return(NULL)
   }
   
-  # spThin requires: data frame with Longitude, Latitude, species
   thin_df <- data.frame(
     species   = "Palaeolithic",
     Longitude = df$Longitude_WGS84,
@@ -153,41 +219,34 @@ thin_sites <- function(df, label, thin_dist_km = THIN_DIST_KM) {
   )
   
   set.seed(42)
-  
-  # Run thinning — 100 repetitions, keep best (most sites)
   result <- spThin::thin(
     loc.data   = thin_df,
     lat.col    = "Latitude",
     long.col   = "Longitude",
     spec.col   = "species",
-    thin.par   = thin_dist_km,   # minimum distance in km
+    thin.par   = thin_dist_km,
     reps       = 100,
     locs.thinned.list.return = TRUE,
     write.files = FALSE,
     verbose    = FALSE
   )
   
-  # Select repetition with most sites retained
   n_kept <- sapply(result, nrow)
   best   <- result[[which.max(n_kept)]]
   
-  # Match thinned coordinates back to original df
-  # (round to 6 decimal places to handle floating point)
   thin_key <- paste(round(best$Longitude, 5),
                     round(best$Latitude,  5))
   orig_key <- paste(round(df$Longitude_WGS84, 5),
                     round(df$Latitude_WGS84,  5))
-  kept_idx <- which(orig_key %in% thin_key)
+  kept_idx    <- which(orig_key %in% thin_key)
+  thinned_df  <- df[kept_idx, ]
   
-  thinned_df <- df[kept_idx, ]
-  cat(sprintf("  [%-18s] %3d → %3d sites  (%.0f%% retained)\n",
+  cat(sprintf("  [%-22s] %3d → %3d  (%.0f%% retained)\n",
               label, nrow(df), nrow(thinned_df),
               100 * nrow(thinned_df) / nrow(df)))
-  
   return(thinned_df)
 }
 
-# Convert thinned data frame back to sf
 df_to_sf <- function(df) {
   if (is.null(df) || nrow(df) == 0) return(NULL)
   sf::st_as_sf(df,
@@ -196,114 +255,55 @@ df_to_sf <- function(df) {
                remove = FALSE)
 }
 
-save_thinned <- function(sf_obj, filename) {
-  if (is.null(sf_obj) || nrow(sf_obj) == 0) return(invisible(NULL))
+save_thinned <- function(df, filename) {
+  sf_obj <- df_to_sf(df)
+  if (is.null(sf_obj)) return(invisible(NULL))
   out_path <- file.path(OUT_SITES, filename)
   sf::st_write(sf_obj, out_path, delete_dsn = TRUE, quiet = TRUE)
-  cat(sprintf("    → Saved: %s\n", filename))
+  cat(sprintf("    → Saved: %s  (%d sites)\n",
+              filename, nrow(sf_obj)))
 }
-
-# ── 4. DEFINE CULTURAL PERIOD POOLS ─────────────────────────
-# Sites attributed to multiple periods counted in each period.
-# LP pool: any site with LP in attribution string
-# MP pool: any site with MP in attribution string
-# UP pool: any site with UP in attribution string
-
-cat("--- Defining Cultural Period Pools ---\n\n")
-
-cult_str <- as.character(sites_df[[cult_col]])
-
-# Detect attribution codes — handle various naming conventions
-is_LP <- grepl("Lower|LP|Acheulian|Acheulean|LPA",
-               cult_str, ignore.case = TRUE)
-is_MP <- grepl("Middle|MP|MSA|MPA",
-               cult_str, ignore.case = TRUE)
-is_UP <- grepl("Upper|UP|Later Stone|LSA|UPA|Microlithic",
-               cult_str, ignore.case = TRUE)
-
-cat(sprintf("  LP pool (before thinning): %d sites\n", sum(is_LP)))
-cat(sprintf("  MP pool (before thinning): %d sites\n", sum(is_MP)))
-cat(sprintf("  UP pool (before thinning): %d sites\n", sum(is_UP)))
-cat(sprintf("  Pooled (all):              %d sites\n\n",
-            nrow(sites_df)))
 
 # ── 5. APPLY THINNING ────────────────────────────────────────
 
-cat("--- Applying Spatial Thinning (1km minimum) ---\n\n")
+cat("--- Spatial Thinning (1km minimum distance) ---\n\n")
 
-thinned_pooled <- thin_sites(sites_df,       "Pooled (all)")
-thinned_LP     <- thin_sites(sites_df[is_LP,], "LP")
-thinned_MP     <- thin_sites(sites_df[is_MP,], "MP")
-thinned_UP     <- thin_sites(sites_df[is_UP,], "UP")
+thinned_pooled <- thin_sites(sites_df,           "Pooled (all 197)")
+thinned_LP     <- thin_sites(sites_df[is_LP, ],  "LP pool")
+thinned_MP     <- thin_sites(sites_df[is_MP, ],  "MP pool")
+thinned_UP     <- thin_sites(sites_df[is_UP, ],  "UP pool")
 
 cat("\n")
 
 # ── 6. ATTRIBUTION SENSITIVITY ANALYSIS (Supp S3) ───────────
-# Stage 1: confirmed sites only per period
-# Stage 2: confirmed + probable sites per period
-# Requires a confidence/precision column
+# Your data has no "probable" tier — only confirmed vs uncertain.
+# Stage 1 = confirmed only (GPS-verified sites)
+# Stage 2 = all sites (confirmed + GIS-based)
+# This tests whether GIS-estimated coordinates affect SHAP rankings.
 
-cat("--- Attribution Sensitivity Analysis (Supp S3) ---\n\n")
+cat("--- Attribution Sensitivity (Supp S3) ---\n\n")
 
-if (!is.null(prec_col) && !is.na(prec_col)) {
-  
-  prec_str <- as.character(sites_df[[prec_col]])
-  
-  # Detect confirmed and probable flags
-  is_confirmed <- grepl("confirm|verified|certain|exact|GPS",
-                        prec_str, ignore.case = TRUE)
-  is_probable  <- grepl("probable|likely|moderate",
-                        prec_str, ignore.case = TRUE)
-  
-  cat(sprintf("  Confirmed sites: %d\n", sum(is_confirmed)))
-  cat(sprintf("  Probable sites:  %d\n", sum(is_probable)))
-  cat(sprintf("  Other/uncertain: %d\n\n",
-              sum(!is_confirmed & !is_probable)))
-  
-  # Stage 1: confirmed only
-  thinned_LP_conf <- thin_sites(
-    sites_df[is_LP & is_confirmed, ], "LP confirmed")
-  thinned_MP_conf <- thin_sites(
-    sites_df[is_MP & is_confirmed, ], "MP confirmed")
-  
-  # Stage 2: confirmed + probable
-  thinned_LP_cp <- thin_sites(
-    sites_df[is_LP & (is_confirmed | is_probable), ],
-    "LP conf+prob")
-  thinned_MP_cp <- thin_sites(
-    sites_df[is_MP & (is_confirmed | is_probable), ],
-    "MP conf+prob")
-  
-  cat("\n")
-  
-} else {
-  cat("  ⚠ No precision/confidence column detected.\n")
-  cat("  Sensitivity analysis not run.\n")
-  cat("  Add attribution confidence to Excel and re-run.\n\n")
-  thinned_LP_conf <- thinned_LP_cp <- NULL
-  thinned_MP_conf <- thinned_MP_cp <- NULL
-}
+thinned_LP_conf <- thin_sites(
+  sites_df[is_LP & is_confirmed, ],   "LP confirmed only")
+thinned_MP_conf <- thin_sites(
+  sites_df[is_MP & is_confirmed, ],   "MP confirmed only")
 
-# ── 7. SAVE ALL THINNED DATASETS ────────────────────────────
+# Stage 2 = all sites (same as main pools — no probable tier)
+thinned_LP_all  <- thinned_LP  # Stage 2 = all = same as main
+thinned_MP_all  <- thinned_MP
+
+cat("  (Stage 2 = all sites = same as main pools)\n\n")
+
+# ── 7. SAVE ALL DATASETS ─────────────────────────────────────
 
 cat("--- Saving Thinned Datasets ---\n\n")
 
-save_list <- list(
-  list(thinned_pooled,  "sites_thinned_pooled.gpkg"),
-  list(thinned_LP,      "sites_thinned_LP.gpkg"),
-  list(thinned_MP,      "sites_thinned_MP.gpkg"),
-  list(thinned_UP,      "sites_thinned_UP.gpkg"),
-  list(thinned_LP_conf, "sites_thinned_LP_confirmed.gpkg"),
-  list(thinned_MP_conf, "sites_thinned_MP_confirmed.gpkg"),
-  list(thinned_LP_cp,   "sites_thinned_LP_conf_prob.gpkg"),
-  list(thinned_MP_cp,   "sites_thinned_MP_conf_prob.gpkg")
-)
-
-for (item in save_list) {
-  sf_obj   <- df_to_sf(item[[1]])
-  filename <- item[[2]]
-  if (!is.null(sf_obj)) save_thinned(sf_obj, filename)
-}
+save_thinned(thinned_pooled,  "sites_thinned_pooled.gpkg")
+save_thinned(thinned_LP,      "sites_thinned_LP.gpkg")
+save_thinned(thinned_MP,      "sites_thinned_MP.gpkg")
+save_thinned(thinned_UP,      "sites_thinned_UP.gpkg")
+save_thinned(thinned_LP_conf, "sites_thinned_LP_confirmed.gpkg")
+save_thinned(thinned_MP_conf, "sites_thinned_MP_confirmed.gpkg")
 
 # ── 8. SUB-MODEL DECISION RULE ───────────────────────────────
 
@@ -312,64 +312,40 @@ cat("  N >= 40:   all 6 algorithms\n")
 cat("  N = 25-39: MaxEnt + RF + GAM only\n")
 cat("  N < 25:    sub-model not viable\n\n")
 
-apply_rule <- function(n, period) {
-  if (is.null(n) || n == 0) {
-    rule <- "NOT VIABLE (N = 0)"
-  } else if (n >= 40) {
-    rule <- "All 6 algorithms"
-  } else if (n >= 25) {
-    rule <- "MaxEnt + RF + GAM only"
-  } else {
-    rule <- "NOT VIABLE (N < 25)"
-  }
-  cat(sprintf("  %-8s N = %3d → %s\n", period,
-              ifelse(is.null(n), 0, n), rule))
-  return(rule)
+apply_rule <- function(thinned_df, period) {
+  n <- if (is.null(thinned_df)) 0 else nrow(thinned_df)
+  rule <- if (n >= 40)  "All 6 algorithms" else
+    if (n >= 25)  "MaxEnt + RF + GAM only" else
+      "NOT VIABLE (N < 25)"
+  cat(sprintf("  %-8s N = %3d → %s\n", period, n, rule))
+  return(list(n = n, rule = rule))
 }
 
-n_pooled <- if (!is.null(thinned_pooled)) nrow(thinned_pooled) else 0
-n_LP     <- if (!is.null(thinned_LP))     nrow(thinned_LP)     else 0
-n_MP     <- if (!is.null(thinned_MP))     nrow(thinned_MP)     else 0
-n_UP     <- if (!is.null(thinned_UP))     nrow(thinned_UP)     else 0
+r_pooled <- apply_rule(thinned_pooled, "Pooled")
+r_LP     <- apply_rule(thinned_LP,     "LP")
+r_MP     <- apply_rule(thinned_MP,     "MP")
+r_UP     <- apply_rule(thinned_UP,     "UP")
 
-rule_pooled <- apply_rule(n_pooled, "Pooled")
-rule_LP     <- apply_rule(n_LP,     "LP")
-rule_MP     <- apply_rule(n_MP,     "MP")
-rule_UP     <- apply_rule(n_UP,     "UP")
-
-# ── 9. TABLE 1 — SITE COUNT SUMMARY ─────────────────────────
+# ── 9. TABLE 1 ───────────────────────────────────────────────
 
 cat("\n--- Table 1: Site Count Summary ---\n\n")
 
+n <- function(d) if (is.null(d)) 0 else nrow(d)
+
 table1 <- data.frame(
-  Period         = c("Pooled","LP","MP","UP",
-                     "LP_confirmed","MP_confirmed",
-                     "LP_conf_prob","MP_conf_prob"),
-  N_before_thin  = c(nrow(sites_df), sum(is_LP), sum(is_MP),
-                     sum(is_UP),
-                     if(!is.null(thinned_LP_conf))
-                       nrow(sites_df[is_LP & is_confirmed,])
-                     else NA,
-                     if(!is.null(thinned_MP_conf))
-                       nrow(sites_df[is_MP & is_confirmed,])
-                     else NA,
-                     if(!is.null(thinned_LP_cp))
-                       nrow(sites_df[is_LP & (is_confirmed|is_probable),])
-                     else NA,
-                     if(!is.null(thinned_MP_cp))
-                       nrow(sites_df[is_MP & (is_confirmed|is_probable),])
-                     else NA),
-  N_after_thin   = c(n_pooled, n_LP, n_MP, n_UP,
-                     if(!is.null(thinned_LP_conf))
-                       nrow(thinned_LP_conf) else NA,
-                     if(!is.null(thinned_MP_conf))
-                       nrow(thinned_MP_conf) else NA,
-                     if(!is.null(thinned_LP_cp))
-                       nrow(thinned_LP_cp)   else NA,
-                     if(!is.null(thinned_MP_cp))
-                       nrow(thinned_MP_cp)   else NA),
-  Decision_rule  = c(rule_pooled, rule_LP, rule_MP, rule_UP,
-                     rep("Sensitivity analysis", 4)),
+  Period        = c("Pooled","LP","MP","UP",
+                    "LP_confirmed","MP_confirmed"),
+  N_raw         = c(nrow(sites_df), sum(is_LP), sum(is_MP),
+                    sum(is_UP),
+                    sum(is_LP & is_confirmed),
+                    sum(is_MP & is_confirmed)),
+  N_thinned     = c(n(thinned_pooled), n(thinned_LP),
+                    n(thinned_MP),     n(thinned_UP),
+                    n(thinned_LP_conf),n(thinned_MP_conf)),
+  Decision      = c(r_pooled$rule, r_LP$rule,
+                    r_MP$rule,     r_UP$rule,
+                    "Sensitivity Stage 1",
+                    "Sensitivity Stage 1"),
   stringsAsFactors = FALSE
 )
 
@@ -377,23 +353,21 @@ write.csv(table1,
           file.path(OUT_TABLES, "Table1_site_counts.csv"),
           row.names = FALSE)
 
-cat(sprintf("  %-18s %12s %12s  %s\n",
-            "Period","Before thin","After thin","Decision"))
-cat("  ", paste(rep("-",65), collapse=""), "\n")
+cat(sprintf("  %-18s %8s %10s  %s\n",
+            "Period","N raw","N thinned","Decision"))
+cat("  ", paste(rep("-", 62), collapse=""), "\n")
 for (i in seq_len(nrow(table1))) {
-  cat(sprintf("  %-18s %12s %12s  %s\n",
+  cat(sprintf("  %-18s %8d %10d  %s\n",
               table1$Period[i],
-              ifelse(is.na(table1$N_before_thin[i]),
-                     "—", table1$N_before_thin[i]),
-              ifelse(is.na(table1$N_after_thin[i]),
-                     "—", table1$N_after_thin[i]),
-              table1$Decision_rule[i]))
+              table1$N_raw[i],
+              table1$N_thinned[i],
+              table1$Decision[i]))
 }
 cat("\n  ✓ Table 1 saved: Table1_site_counts.csv\n\n")
 
 # ── 10. DIAGNOSTIC MAP ───────────────────────────────────────
 
-cat("--- Generating Thinning Diagnostic Map ---\n")
+cat("--- Diagnostic Map ---\n")
 
 template_30m  <- terra::rast(file.path(OUT_PREDICTORS,
                                        "TEMPLATE_30m_utm44n.tif"))
@@ -405,22 +379,26 @@ png(file.path(OUT_FIG_SUPP, "S0h_thinning_result.png"),
     width = 4800, height = 2400, res = 300)
 par(mfrow = c(1, 2), mar = c(2, 2, 3, 1))
 
-# Before thinning
-terra::plot(template_30m, col="grey95", legend=FALSE, axes=FALSE,
-            main=sprintf("Before Thinning\n(N = %d)", nrow(sites_df)))
-terra::plot(boundary_vect, add=TRUE, border="grey50", lwd=0.8)
-terra::plot(terra::vect(sites_geo), add=TRUE,
-            col="steelblue", pch=16, cex=0.3)
+terra::plot(template_30m, col = "grey95",
+            legend = FALSE, axes = FALSE,
+            main = sprintf("Before Thinning (N = %d)",
+                           nrow(sites_df)))
+terra::plot(boundary_vect, add = TRUE,
+            border = "grey50", lwd = 0.8)
+terra::plot(terra::vect(sites_geo), add = TRUE,
+            col = "steelblue", pch = 16, cex = 0.3)
 
-# After thinning
 if (!is.null(thinned_pooled)) {
-  thinned_sf <- df_to_sf(thinned_pooled)
-  thinned_geo <- sf::st_transform(thinned_sf, crs=4326)
-  terra::plot(template_30m, col="grey95", legend=FALSE, axes=FALSE,
-              main=sprintf("After Thinning (1km)\n(N = %d)", n_pooled))
-  terra::plot(boundary_vect, add=TRUE, border="grey50", lwd=0.8)
-  terra::plot(terra::vect(thinned_geo), add=TRUE,
-              col="firebrick", pch=16, cex=0.4)
+  tf <- df_to_sf(thinned_pooled)
+  tg <- sf::st_transform(tf, 4326)
+  terra::plot(template_30m, col = "grey95",
+              legend = FALSE, axes = FALSE,
+              main = sprintf("After Thinning 1km (N = %d)",
+                             n(thinned_pooled)))
+  terra::plot(boundary_vect, add = TRUE,
+              border = "grey50", lwd = 0.8)
+  terra::plot(terra::vect(tg), add = TRUE,
+              col = "firebrick", pch = 16, cex = 0.4)
 }
 
 dev.off()
@@ -431,13 +409,13 @@ cat("  ✓ S0h_thinning_result.png\n\n")
 cat("========================================\n")
 cat("SCRIPT 08 COMPLETE — Summary\n")
 cat("========================================\n")
-cat(sprintf("Pooled:  %3d → %3d  %s\n",
-            nrow(sites_df), n_pooled, rule_pooled))
-cat(sprintf("LP:      %3d → %3d  %s\n",
-            sum(is_LP), n_LP, rule_LP))
-cat(sprintf("MP:      %3d → %3d  %s\n",
-            sum(is_MP), n_MP, rule_MP))
-cat(sprintf("UP:      %3d → %3d  %s\n",
-            sum(is_UP), n_UP, rule_UP))
+cat(sprintf("Pooled: %3d → %3d  %s\n",
+            nrow(sites_df), n(thinned_pooled), r_pooled$rule))
+cat(sprintf("LP:     %3d → %3d  %s\n",
+            sum(is_LP), n(thinned_LP), r_LP$rule))
+cat(sprintf("MP:     %3d → %3d  %s\n",
+            sum(is_MP), n(thinned_MP), r_MP$rule))
+cat(sprintf("UP:     %3d → %3d  %s\n",
+            sum(is_UP), n(thinned_UP), r_UP$rule))
 cat("\nNext: Run Script 09 — Bias Correction + Background\n")
 cat("========================================\n")
