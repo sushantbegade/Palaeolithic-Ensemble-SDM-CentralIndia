@@ -75,9 +75,7 @@ Raw data sources:
 
 ## Citation
 
-Begade, S., [Year]. [Full paper title]. 
-Journal of Archaeological Science. 
-https://doi.org/[INSERT AT PUBLICATION]
+Begade, S., and Sahu, P. 2026. A Multi-Model Ensemble Framework with Spatial Explainability for Predicting Open-Air Palaeolithic Site Distribution in Central India: Bias Correction, Algorithmic Diversity, and Spatially Heterogeneous Predictor Importance. Journal of Archaeological Science. (Under Review)
 
 ---
 
