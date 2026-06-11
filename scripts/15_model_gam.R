@@ -10,25 +10,19 @@
 # Script: 15 of 25
 # ============================================================
 # SPECIFICATION (Research Design 5.7.5):
-#   family:  binomial(link="logit")
-#   method:  REML (preferred for smooth term selection)
-#   select:  TRUE (shrinkage penalty — automatic variable
-#            selection; uninformative smooths shrunk to zero)
-#   k:       5 basis dimensions for all continuous smooths
-#            (sufficient for N=188 presence records)
-#   Continuous predictors: s(x, k=5)
-#   Categorical predictors: s(x, bs="re") random effects
-#   Formula built from final_predictor_names.rds
+#   family: binomial(link="logit")
+#   method: REML  |  select: TRUE
+#   k: 5 basis dimensions for all continuous smooths
+#   Continuous: s(x, k=5)
+#   Categorical: s(x, bs="re") random effects smooths
+#   Case weights: presence = N_BG/N_PRES, background = 1
 #
-# METHODS NOTE (verbatim for manuscript 5.7.5):
-#   "GAM model selection used the shrinkage penalty
-#    (select=TRUE in mgcv) which drives uninformative smooth
-#    terms toward zero, providing automatic variable selection
-#    within a single model fit (Wood 2017). method='REML' is
-#    preferred for smooth term selection (Wood 2011)."
-#
-# OUTPUT: predict(type="response") → probability [0,1]
-# TILED PREDICTION: 4 tiles with NA-safe wrapper
+# FIX v3 — RASTER UNIQUE VALUES:
+#   terra::global(x,"unique") not available in all versions.
+#   Replaced with terra::freq() which is memory-efficient
+#   and universally supported across terra versions.
+#   terra::freq(raster) returns a data frame of unique values
+#   and their counts without loading all values into RAM.
 # ============================================================
 
 # ── 0. SOURCE SCRIPT 01 ─────────────────────────────────────
@@ -100,20 +94,6 @@ calc_auc <- function(ps, pb) {
               c(ps,pb), quiet=TRUE)))
 }
 
-# NA-safe GAM predict wrapper
-gam_predict_safe <- function(model, data, ...) {
-  result        <- rep(NA_real_, nrow(data))
-  complete_rows <- complete.cases(data)
-  if (any(complete_rows)) {
-    result[complete_rows] <- predict(
-      model,
-      newdata = data[complete_rows,,drop=FALSE],
-      type    = "response"
-    )
-  }
-  return(result)
-}
-
 # ── 1. LOAD INPUTS ───────────────────────────────────────────
 
 cat("--- Loading Inputs ---\n")
@@ -145,11 +125,33 @@ cont_names     <- final_names[!final_names %in% cat_predictors]
 
 cat("  Sites:", nrow(sites_sf),
     "  Background:", nrow(bg_sf), "\n")
-cat("  Continuous predictors:", length(cont_names), "\n")
-cat("  Categorical predictors:",
-    paste(cat_in_stack, collapse=", "), "\n\n")
+cat("  Continuous:", length(cont_names),
+    "  Categorical:", paste(cat_in_stack, collapse=", "),
+    "\n\n")
 
-# ── 2. EXTRACT PREDICTOR VALUES ──────────────────────────────
+# ── 2. RASTER FACTOR LEVELS VIA terra::freq() ────────────────
+# terra::freq() computes unique value frequency table
+# without loading full raster into memory — safe for large
+# rasters and universally supported across terra versions.
+
+cat("--- Extracting Raster Factor Levels (terra::freq) ---\n")
+
+raster_levels <- list()
+for (col in cat_in_stack) {
+  r_layer  <- terra::subset(pred_stack,
+                            which(names(pred_stack)==col))
+  freq_tbl <- terra::freq(r_layer)
+  # freq() returns data frame with columns: layer, value, count
+  all_vals <- sort(unique(
+    as.integer(freq_tbl$value[!is.na(freq_tbl$value)])))
+  raster_levels[[col]] <- all_vals
+  cat(sprintf("  %s: %d unique values (%d to %d)\n",
+              col, length(all_vals),
+              min(all_vals), max(all_vals)))
+}
+cat("\n")
+
+# ── 3. EXTRACT PREDICTOR VALUES ──────────────────────────────
 
 cat("--- Extracting Predictor Values ---\n")
 
@@ -165,27 +167,27 @@ bg_vals      <- bg_vals[bg_ok, ]
 site_folds_c <- site_folds[sites_ok]
 bg_folds_c   <- bg_folds[bg_ok]
 
-# Categoricals as factors for GAM bs="re"
+# Apply raster-derived factor levels
 for (col in cat_in_stack) {
-  all_levels <- sort(unique(c(
-    as.integer(sites_vals[[col]]),
-    as.integer(bg_vals[[col]]))))
+  lvls <- raster_levels[[col]]
   sites_vals[[col]] <- factor(as.integer(sites_vals[[col]]),
-                              levels=all_levels)
+                              levels=lvls)
   bg_vals[[col]]    <- factor(as.integer(bg_vals[[col]]),
-                              levels=all_levels)
+                              levels=lvls)
 }
 
 N_PRES <- nrow(sites_vals)
 N_BG   <- nrow(bg_vals)
-cat(sprintf("  Sites: %d  Background: %d\n\n", N_PRES, N_BG))
+WT     <- N_BG / N_PRES
 
-# ── 3. BUILD GAM FORMULA ─────────────────────────────────────
+cat(sprintf("  Sites: %d  Background: %d\n",
+            N_PRES, N_BG))
+cat(sprintf("  Presence case weight: %.2f\n\n", WT))
+
+# ── 4. BUILD GAM FORMULA ─────────────────────────────────────
 
 cat("--- Building GAM Formula ---\n\n")
 
-# Continuous predictors: s(x, k=5)
-# Categorical predictors: s(x, bs="re") random effects
 smooth_terms <- c(
   paste0("s(", cont_names, ", k=5)"),
   paste0("s(", cat_in_stack, ", bs='re')")
@@ -194,20 +196,19 @@ smooth_terms <- c(
 gam_formula <- as.formula(
   paste("presence ~", paste(smooth_terms, collapse=" + ")))
 
-cat("  Formula:\n  presence ~\n")
-for (term in smooth_terms) cat("   +", term, "\n")
+for (term in smooth_terms) cat("  +", term, "\n")
 cat("\n")
 
-# ── 4. FIT FINAL GAM MODEL ───────────────────────────────────
+# ── 5. FIT FINAL GAM ─────────────────────────────────────────
 
 cat("--- Fitting Final GAM ---\n")
-cat("  family: binomial(link=logit)\n")
-cat("  method: REML  |  select: TRUE\n")
-cat("  Training: all", N_PRES+N_BG, "records\n\n")
+cat("  method: REML  select: TRUE\n")
+cat(sprintf("  Presence weight: %.1f  Background: 1\n\n", WT))
 
-all_resp <- c(rep(1L, N_PRES), rep(0L, N_BG))
-all_data <- rbind(sites_vals, bg_vals)
-all_df   <- cbind(presence=all_resp, all_data)
+all_resp    <- c(rep(1L,N_PRES), rep(0L,N_BG))
+all_data    <- rbind(sites_vals, bg_vals)
+all_df      <- cbind(presence=all_resp, all_data)
+all_weights <- c(rep(WT,N_PRES), rep(1,N_BG))
 
 set.seed(42)
 t0 <- proc.time()
@@ -217,16 +218,16 @@ gam_model <- mgcv::gam(
   family  = binomial(link="logit"),
   method  = "REML",
   select  = TRUE,
+  weights = all_weights,
   data    = all_df
 )
 
 cat(sprintf("  Done in %.1f min\n",
             (proc.time()-t0)[3]/60))
 
-# Summary of smooth terms
 gam_sum <- summary(gam_model)
-cat("\n  Smooth term EDFs (effective degrees of freedom):\n")
-cat("  (EDF ≈ 0 = shrunk to zero by select=TRUE)\n\n")
+cat("\n  Smooth term EDFs:\n\n")
+
 edf_df <- data.frame(
   term    = rownames(gam_sum$s.table),
   edf     = round(gam_sum$s.table[,"edf"], 3),
@@ -234,23 +235,25 @@ edf_df <- data.frame(
   stringsAsFactors=FALSE
 )
 for (i in seq_len(nrow(edf_df))) {
-  shrunk <- if (edf_df$edf[i] < 0.05) " ← shrunk to zero" else ""
-  cat(sprintf("  %-30s EDF=%.3f  p=%.4f%s\n",
+  note <- if (edf_df$edf[i] < 0.05) " ← shrunk" else ""
+  cat(sprintf("  %-32s EDF=%.3f  p=%.4f%s\n",
               edf_df$term[i], edf_df$edf[i],
-              edf_df$p_value[i], shrunk))
+              edf_df$p_value[i], note))
 }
 
-cat(sprintf("\n  Deviance explained: %.1f%%\n",
-            100 * (1 - gam_model$deviance/gam_model$null.deviance)))
-cat(sprintf("  GCV score: %.4f\n", gam_model$gcv.ubre))
+dev_expl <- 100*(1-gam_model$deviance/gam_model$null.deviance)
+cat(sprintf("\n  Deviance explained: %.1f%%\n", dev_expl))
 
 saveRDS(gam_model,
         file.path(OUT_MOD_IND,"gam_model_final.rds"))
-cat("  ✓ gam_model_final.rds\n\n")
+saveRDS(raster_levels,
+        file.path(OUT_MOD_IND,"gam_raster_levels.rds"))
+cat("  ✓ gam_model_final.rds\n")
+cat("  ✓ gam_raster_levels.rds\n\n")
 
-rm(all_df, all_data, all_resp); gc(full=TRUE)
+rm(all_df, all_data, all_resp, all_weights); gc(full=TRUE)
 
-# ── 5. 5-FOLD SPATIAL BLOCK CV ───────────────────────────────
+# ── 6. 5-FOLD SPATIAL BLOCK CV ───────────────────────────────
 
 cat("--- 5-Fold Spatial Block CV ---\n\n")
 
@@ -265,6 +268,8 @@ for (f in 1:5) {
                rep(0L,sum(bg_folds_c!=f)))
   tr_data <- rbind(sites_vals[site_folds_c!=f,],
                    bg_vals[bg_folds_c!=f,])
+  tr_wts  <- c(rep(WT,sum(site_folds_c!=f)),
+               rep(1, sum(bg_folds_c!=f)))
   tr_df   <- cbind(presence=tr_resp, tr_data)
   
   ts_s <- which(site_folds_c==f)
@@ -272,52 +277,43 @@ for (f in 1:5) {
   
   set.seed(42)
   fold_gam <- tryCatch(
-    mgcv::gam(
-      formula = gam_formula,
-      family  = binomial(link="logit"),
-      method  = "REML",
-      select  = TRUE,
-      data    = tr_df
-    ),
-    error = function(e) {
-      cat("ERROR:", conditionMessage(e), "\n")
-      NULL
+    mgcv::gam(gam_formula,
+              family=binomial(link="logit"),
+              method="REML", select=TRUE,
+              weights=tr_wts, data=tr_df),
+    error=function(e) {
+      cat("ERROR:", conditionMessage(e),"\n"); NULL
     }
   )
   
   if (is.null(fold_gam)) {
-    fold_aucs[f] <- NA_real_
-    next
+    fold_aucs[f] <- NA_real_; next
   }
   
-  # Ensure test data factor levels match training
-  ts_data_s <- sites_vals[ts_s,]
-  ts_data_b <- bg_vals[ts_b,]
+  ts_s_d <- sites_vals[ts_s,]
+  ts_b_d <- bg_vals[ts_b,]
   for (col in cat_in_stack) {
-    ts_data_s[[col]] <- factor(
-      as.integer(ts_data_s[[col]]),
-      levels=levels(tr_data[[col]]))
-    ts_data_b[[col]] <- factor(
-      as.integer(ts_data_b[[col]]),
-      levels=levels(tr_data[[col]]))
+    ts_s_d[[col]] <- factor(as.integer(ts_s_d[[col]]),
+                            levels=raster_levels[[col]])
+    ts_b_d[[col]] <- factor(as.integer(ts_b_d[[col]]),
+                            levels=raster_levels[[col]])
   }
   
-  ps <- gam_predict_safe(fold_gam, ts_data_s)
-  pb <- gam_predict_safe(fold_gam, ts_data_b)
-  
-  # Remove NAs before AUC
-  ps_valid <- ps[is.finite(ps)]
-  pb_valid <- pb[is.finite(pb)]
+  ps <- suppressWarnings(predict(fold_gam, ts_s_d,
+                                 type="response"))
+  pb <- suppressWarnings(predict(fold_gam, ts_b_d,
+                                 type="response"))
   
   cv_preds_sites[ts_s] <- ps
   cv_preds_bg[ts_b]    <- pb
-  fold_aucs[f]         <- calc_auc(ps_valid, pb_valid)
+  fold_aucs[f] <- calc_auc(ps[is.finite(ps)],
+                           pb[is.finite(pb)])
   
   cat(sprintf("AUC=%.4f  (%d sites/%d bg)\n",
               fold_aucs[f], length(ts_s), length(ts_b)))
   
-  rm(fold_gam, tr_df, tr_data, tr_resp,
-     ts_data_s, ts_data_b, ps, pb)
+  rm(fold_gam, tr_df, tr_data, tr_resp, tr_wts,
+     ts_s_d, ts_b_d, ps, pb)
   gc(full=TRUE)
 }
 
@@ -326,34 +322,23 @@ cv_auc_sd   <- sd(fold_aucs, na.rm=TRUE)
 cat(sprintf("\n  CV AUC: %.4f ± %.4f\n\n",
             cv_auc_mean, cv_auc_sd))
 
-# ── 6. TILED RASTER PREDICTION ───────────────────────────────
+# ── 7. TILED RASTER PREDICTION ───────────────────────────────
 
 cat("--- Tiled Raster Prediction (4 tiles) ---\n\n")
 
-# Wrapper: ensure factor levels match training data
-# and handle NAs
-gam_tile_wrapper <- function(model, data, ...) {
+gam_tile_fn <- function(model, data, ...) {
   result <- rep(NA_real_, nrow(data))
-  # Apply factor levels for categorical columns
   for (col in cat_in_stack) {
     if (col %in% names(data)) {
-      train_levels <- levels(gam_model$model[[col]])
-      if (!is.null(train_levels)) {
-        data[[col]] <- factor(as.integer(data[[col]]),
-                              levels=as.integer(train_levels))
-      } else {
-        data[[col]] <- factor(as.integer(data[[col]]))
-      }
+      data[[col]] <- factor(as.integer(data[[col]]),
+                            levels=raster_levels[[col]])
     }
   }
-  complete_rows <- complete.cases(data)
-  if (any(complete_rows)) {
-    result[complete_rows] <- tryCatch(
-      predict(model,
-              newdata = data[complete_rows,,drop=FALSE],
-              type    = "response"),
-      error = function(e) rep(NA_real_, sum(complete_rows))
-    )
+  ok <- complete.cases(data)
+  if (any(ok)) {
+    result[ok] <- suppressWarnings(
+      predict(model, newdata=data[ok,,drop=FALSE],
+              type="response"))
   }
   return(result)
 }
@@ -371,15 +356,11 @@ for (i in 1:4) {
   tile_paths[i] <- file.path("E:/R_temp",
                              sprintf("gam_tile%d.tif",i))
   t0 <- proc.time()
-  
-  terra::predict(ts, gam_model,
-                 fun       = gam_tile_wrapper,
-                 na.rm     = FALSE,
-                 filename  = tile_paths[i],
-                 overwrite = TRUE,
-                 wopt      = list(datatype="FLT4S"))
-  
-  cat(sprintf("%.1f min\n", (proc.time()-t0)[3]/60))
+  terra::predict(ts, gam_model, fun=gam_tile_fn,
+                 na.rm=FALSE, filename=tile_paths[i],
+                 overwrite=TRUE,
+                 wopt=list(datatype="FLT4S"))
+  cat(sprintf("%.1f min\n",(proc.time()-t0)[3]/60))
   rm(ts); gc(full=TRUE)
 }
 
@@ -399,36 +380,25 @@ cat(sprintf("  Range: %.4f to %.4f (mean %.4f)\n",
 cat("  ✓ gam_pred_prob.tif\n\n")
 gc(full=TRUE)
 
-# ── 7. EVALUATION METRICS ────────────────────────────────────
+# ── 8. EVALUATION METRICS ────────────────────────────────────
 
 cat("--- Evaluation Metrics ---\n\n")
 
-all_resp2 <- c(rep(1L,N_PRES), rep(0L,N_BG))
-all_data2 <- rbind(sites_vals, bg_vals)
-for (col in cat_in_stack) {
-  lvls <- levels(gam_model$model[[col]])
-  if (!is.null(lvls)) {
-    all_data2[[col]] <- factor(as.integer(all_data2[[col]]),
-                               levels=as.integer(lvls))
-  }
-}
-full_ps  <- gam_predict_safe(gam_model, sites_vals)
-full_pb  <- gam_predict_safe(gam_model, bg_vals)
+full_ps <- suppressWarnings(
+  predict(gam_model, sites_vals, type="response"))
+full_pb <- suppressWarnings(
+  predict(gam_model, bg_vals, type="response"))
 auc_full <- safe_scalar(calc_auc(
   full_ps[is.finite(full_ps)],
   full_pb[is.finite(full_pb)]))
 
-cv_s_valid <- cv_preds_sites[is.finite(cv_preds_sites)]
-cv_b_valid <- cv_preds_bg[is.finite(cv_preds_bg)]
+cv_s_v <- cv_preds_sites[is.finite(cv_preds_sites)]
+cv_b_v <- cv_preds_bg[is.finite(cv_preds_bg)]
 
-boyce_val <- compute_boyce(
-  fit = c(cv_s_valid, cv_b_valid),
-  obs = cv_s_valid)
-
-tss_val <- compute_tss(
-  obs  = c(rep(1,length(cv_s_valid)),
-           rep(0,length(cv_b_valid))),
-  pred = c(cv_s_valid, cv_b_valid))
+boyce_val <- compute_boyce(c(cv_s_v,cv_b_v), cv_s_v)
+tss_val   <- compute_tss(
+  obs  = c(rep(1,length(cv_s_v)),rep(0,length(cv_b_v))),
+  pred = c(cv_s_v,cv_b_v))
 
 area_cells <- terra::global(!is.na(gam_raster),
                             "sum",na.rm=TRUE)[1,1]
@@ -446,37 +416,26 @@ cat(sprintf("  Full AUC (diag):   %.4f\n", sm(auc_full)))
 cat(sprintf("  Boyce Index:       %.4f\n", sm(boyce_val)))
 cat(sprintf("  TSS (max-TSS):     %.4f\n", sm(tss_val)))
 cat(sprintf("  Kvamme's Gain:     %.4f\n", sm(kg)))
-cat(sprintf("  Deviance expl.:    %.1f%%\n",
-            100*(1-gam_model$deviance/gam_model$null.deviance)))
+cat(sprintf("  Deviance expl.:    %.1f%%\n", dev_expl))
 cat(sprintf("  Area > 0.5:        %.1f%%\n",100*area_pct))
 cat(sprintf("  Sites > 0.5:       %.1f%%\n",100*sites_pct))
 
-# ── 8. SAVE OUTPUTS ──────────────────────────────────────────
+shrunk <- edf_df$term[edf_df$edf < 0.05]
+cat("  Shrunk to zero:", if(length(shrunk)==0) "none" else
+  paste(shrunk, collapse=", "), "\n")
 
-# Predictors shrunk to zero by select=TRUE
-shrunk_vars <- edf_df$term[edf_df$edf < 0.05]
-cat("\n  Shrunk to zero by select=TRUE:",
-    if (length(shrunk_vars)==0) "none" else
-      paste(shrunk_vars, collapse=", "), "\n")
+# ── 9. SAVE OUTPUTS ──────────────────────────────────────────
 
 metrics_df <- data.frame(
-  algorithm       = "GAM",
-  family          = "binomial(logit)",
-  method          = "REML",
-  select          = TRUE,
-  deviance_expl   = round(
-    100*(1-gam_model$deviance/gam_model$null.deviance),2),
-  shrunk_terms    = paste(shrunk_vars, collapse=";"),
-  cv_auc_mean     = sm(cv_auc_mean),
-  cv_auc_sd       = sm(cv_auc_sd),
-  full_auc        = sm(auc_full),
-  boyce_index     = sm(boyce_val),
-  tss_max         = sm(tss_val),
-  kvamme_gain     = sm(kg),
+  algorithm="GAM", method="REML", select=TRUE,
+  case_wt=round(WT,2), deviance_expl=round(dev_expl,2),
+  shrunk_terms=paste(shrunk,collapse=";"),
+  cv_auc_mean=sm(cv_auc_mean), cv_auc_sd=sm(cv_auc_sd),
+  full_auc=sm(auc_full), boyce_index=sm(boyce_val),
+  tss_max=sm(tss_val), kvamme_gain=sm(kg),
   fold1_auc=sm(fold_aucs[1]), fold2_auc=sm(fold_aucs[2]),
   fold3_auc=sm(fold_aucs[3]), fold4_auc=sm(fold_aucs[4]),
-  fold5_auc=sm(fold_aucs[5]),
-  stringsAsFactors=FALSE
+  fold5_auc=sm(fold_aucs[5]), stringsAsFactors=FALSE
 )
 
 write.csv(metrics_df,
@@ -490,21 +449,18 @@ saveRDS(list(site_preds=cv_preds_sites,
              fold_aucs=fold_aucs),
         file.path(OUT_MOD_IND,"gam_cv_predictions.rds"))
 
-cat("  ✓ gam_evaluation.csv\n")
+cat("\n  ✓ gam_evaluation.csv\n")
 cat("  ✓ gam_smooth_edfs.csv\n")
 cat("  ✓ gam_cv_predictions.rds\n\n")
 
-# ── 9. FIGURE ───────────────────────────────────────────────
+# ── 10. FIGURE ───────────────────────────────────────────────
 
 cat("--- Diagnostic Figure ---\n")
-
 png(file.path(OUT_FIG_MAIN,"Fig_GAM_prediction.png"),
-    width=2400, height=2400, res=300)
+    width=2400,height=2400,res=300)
 terra::plot(gam_raster,
-            main=sprintf(
-              "GAM — Probability\nCV AUC=%.4f±%.4f  Dev.expl=%.1f%%",
-              cv_auc_mean,cv_auc_sd,
-              100*(1-gam_model$deviance/gam_model$null.deviance)),
+            main=sprintf("GAM — Probability\nCV AUC=%.4f±%.4f  Dev=%.1f%%",
+                         cv_auc_mean,cv_auc_sd,dev_expl),
             col=viridisLite::viridis(100),range=c(0,1),axes=FALSE)
 terra::plot(boundary_vect,add=TRUE,border="white",lwd=0.8)
 terra::plot(terra::vect(sites_sf),add=TRUE,
@@ -512,14 +468,15 @@ terra::plot(terra::vect(sites_sf),add=TRUE,
 dev.off()
 cat("  ✓ Fig_GAM_prediction.png\n\n")
 
-# ── 10. SUMMARY ──────────────────────────────────────────────
+# ── 11. SUMMARY ──────────────────────────────────────────────
 
 cat("========================================\n")
 cat("SCRIPT 15 COMPLETE — GAM\n")
 cat("========================================\n")
-cat("family=binomial  method=REML  select=TRUE\n")
-cat(sprintf("Deviance expl.: %.1f%%\n",
-            100*(1-gam_model$deviance/gam_model$null.deviance)))
+cat("method=REML  select=TRUE\n")
+cat(sprintf("Case weight: presence=%.1f  background=1\n",WT))
+cat(sprintf("Factor levels from terra::freq() ✓\n"))
+cat(sprintf("Deviance expl.: %.1f%%\n", dev_expl))
 cat(sprintf("CV AUC:        %.4f ± %.4f\n",
             cv_auc_mean,cv_auc_sd))
 cat(sprintf("Boyce Index:   %.4f\n", sm(boyce_val)))
@@ -527,6 +484,5 @@ cat(sprintf("TSS:           %.4f\n", sm(tss_val)))
 cat(sprintf("Kvamme's Gain: %.4f\n", sm(kg)))
 cat("Output: probability [0,1] ✓\n")
 cat("Tiled prediction (4 tiles) ✓\n")
-cat("All I/O: E drive ✓\n")
 cat("\nNext: Run Script 16 — SVM\n")
 cat("========================================\n")
