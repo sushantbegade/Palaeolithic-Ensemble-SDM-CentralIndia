@@ -11,20 +11,23 @@
 # ============================================================
 # PARAMETERS (Research Design 5.7.6):
 #   Kernel:    RBF (Gaussian)
-#   type:      C-svc (C-classification)
-#   Grid:      C ∈ {0.01, 0.1, 1, 10, 100}
-#              sigma ∈ {0.001, 0.01, 0.1, 1} → 20 combinations
+#   type:      C-svc
+#   Grid:      C ∈ {0.1, 1, 10, 50, 100, 500}
+#              sigma ∈ {0.01, 0.05, 0.1, 0.5, 1.0} → 30 combos
 #   Tuning:    fold-1 AUC screening → top 5 → full 5-fold CV
+#              PREFERENCE: converged models over non-converged
+#   class.weights: c(neg=1, pos=sqrt(N_BG/N_PRES))
+#              Moderate weighting — corrects imbalance without
+#              overwhelming the SVM optimizer (full SPW=52.9
+#              causes convergence failures; sqrt ≈ 7.3 stable)
 #   Probs:     prob.model=TRUE (Platt scaling, internal)
-#   Scaling:   all continuous predictors z-standardised
-#              (mean=0, SD=1) before fitting — REQUIRED for SVM
-#              Scaling parameters saved for prediction
-#   Categoricals: one-hot encoded (model.matrix) — SVM needs
-#                 all-numeric input
+#   Scaling:   continuous predictors z-standardised
+#   Categoricals: one-hot encoded (model.matrix)
 #
-# TILED PREDICTION: 4 tiles with NA-safe wrapper.
-#   Wrapper applies same z-standardisation and one-hot
-#   encoding as training before calling predict().
+# CONVERGENCE TRACKING:
+#   "maximum number of iterations reached" = non-converged.
+#   Models are flagged; converged models preferred in selection.
+#   If all top-5 non-converged, select by AUC among them.
 # ============================================================
 
 # ── 0. SOURCE SCRIPT 01 ─────────────────────────────────────
@@ -91,9 +94,40 @@ compute_boyce <- function(fit, obs, n_bins = 101) {
 }
 
 calc_auc <- function(ps, pb) {
+  ps <- ps[is.finite(ps)]; pb <- pb[is.finite(pb)]
+  if (length(ps)==0 || length(pb)==0) return(NA_real_)
   as.numeric(pROC::auc(
     pROC::roc(c(rep(1,length(ps)),rep(0,length(pb))),
               c(ps,pb), quiet=TRUE)))
+}
+
+# Fit SVM and track convergence warnings
+fit_svm_tracked <- function(x, y, C_val, sig_val, cw) {
+  converged  <- TRUE
+  warn_msgs  <- character(0)
+  
+  m <- withCallingHandlers(
+    tryCatch(
+      kernlab::ksvm(x, y,
+                    type          = "C-svc",
+                    kernel        = "rbfdot",
+                    kpar          = list(sigma=sig_val),
+                    C             = C_val,
+                    class.weights = cw,
+                    prob.model    = TRUE,
+                    scaled        = FALSE),
+      error=function(e) NULL
+    ),
+    warning=function(w) {
+      if (grepl("maximum number of iterations",
+                conditionMessage(w))) {
+        converged  <<- FALSE
+        warn_msgs  <<- c(warn_msgs, conditionMessage(w))
+      }
+      invokeRestart("muffleWarning")
+    }
+  )
+  list(model=m, converged=converged)
 }
 
 # ── 1. LOAD INPUTS ───────────────────────────────────────────
@@ -125,12 +159,15 @@ cat_predictors <- c("Geology","Geomorphology")
 cat_in_stack   <- cat_predictors[cat_predictors %in% final_names]
 cont_names     <- final_names[!final_names %in% cat_predictors]
 
+raster_levels  <- readRDS(
+  file.path(OUT_MOD_IND,"gam_raster_levels.rds"))
+
 cat("  Sites:", nrow(sites_sf),
     "  Background:", nrow(bg_sf), "\n\n")
 
-# ── 2. EXTRACT PREDICTOR VALUES ──────────────────────────────
+# ── 2. EXTRACT AND PREPROCESS ────────────────────────────────
 
-cat("--- Extracting Predictor Values ---\n")
+cat("--- Extracting and Preprocessing ---\n")
 
 sites_vals <- terra::extract(pred_stack,
                              terra::vect(sites_sf), ID=FALSE)
@@ -145,223 +182,223 @@ site_folds_c <- site_folds[sites_ok]
 bg_folds_c   <- bg_folds[bg_ok]
 
 N_PRES <- nrow(sites_vals); N_BG <- nrow(bg_vals)
-cat(sprintf("  Sites: %d  Background: %d\n\n", N_PRES, N_BG))
 
-# ── 3. PREPROCESSING ─────────────────────────────────────────
-# (a) Compute scaling params from TRAINING data
-# (b) z-standardise continuous predictors (mean=0, SD=1)
-# (c) One-hot encode categorical predictors
+# Class weight — sqrt(ratio) for stability
+# Full ratio (52.9) causes convergence failures
+# sqrt(52.9) ≈ 7.3 corrects imbalance without overwhelming optimizer
+SPW_FULL <- N_BG / N_PRES
+SPW_SVM  <- sqrt(SPW_FULL)
+CW <- c("neg"=1, "pos"=SPW_SVM)
 
-cat("--- Preprocessing ---\n")
+cat(sprintf("  Sites: %d  Background: %d\n", N_PRES, N_BG))
+cat(sprintf("  Full SPW=%.1f  SVM class weight=%.2f (sqrt)\n\n",
+            SPW_FULL, SPW_SVM))
 
-# Load raster-derived factor levels (from GAM script)
-raster_levels <- readRDS(
-  file.path(OUT_MOD_IND,"gam_raster_levels.rds"))
-
-# Scaling parameters from combined sites+background
+# Scaling parameters from full dataset
 all_raw <- rbind(sites_vals, bg_vals)
-
 scale_params <- setNames(
   lapply(cont_names, function(col) {
-    list(mean = mean(all_raw[[col]], na.rm=TRUE),
-         sd   = max(sd(all_raw[[col]], na.rm=TRUE), 1e-10))
-  }),
-  cont_names
-)
+    list(mean=mean(all_raw[[col]],na.rm=TRUE),
+         sd  =max(sd(all_raw[[col]],na.rm=TRUE),1e-10))
+  }), cont_names)
 
-# Function: preprocess a data frame → numeric matrix
-preprocess_svm <- function(df, scale_p, cat_cols,
-                           rast_lvls) {
+# Preprocess: z-scale + one-hot encode
+preprocess_svm <- function(df, sp, cat_cols, rl) {
   df2 <- df
-  # Scale continuous
-  for (col in names(scale_p)) {
-    df2[[col]] <- (df2[[col]] - scale_p[[col]]$mean) /
-      scale_p[[col]]$sd
+  for (col in names(sp)) {
+    df2[[col]] <- (df2[[col]]-sp[[col]]$mean)/sp[[col]]$sd
   }
-  # One-hot encode categorical
   for (col in cat_cols) {
     df2[[col]] <- factor(as.integer(df2[[col]]),
-                         levels=rast_lvls[[col]])
+                         levels=rl[[col]])
   }
-  # model.matrix drops intercept
-  mm <- model.matrix(~ . - 1, data=df2)
-  return(mm)
+  model.matrix(~.-1, data=df2)
 }
 
-# Preprocess all data
 sites_mat <- preprocess_svm(sites_vals, scale_params,
                             cat_in_stack, raster_levels)
 bg_mat    <- preprocess_svm(bg_vals,    scale_params,
                             cat_in_stack, raster_levels)
 
-cat("  Continuous: z-standardised\n")
-cat("  Categorical: one-hot encoded\n")
-cat("  Feature matrix columns:", ncol(sites_mat), "\n\n")
+feat_names <- colnames(sites_mat)
+cat(sprintf("  Feature matrix: %d columns\n",
+            length(feat_names)))
+cat("  Continuous: z-standardised ✓\n")
+cat("  Categorical: one-hot encoded ✓\n\n")
 
-# Save preprocessing parameters for prediction
+# Save preprocessing params
 saveRDS(list(scale_params=scale_params,
              cat_levels=raster_levels,
              cat_cols=cat_in_stack,
              cont_cols=cont_names,
-             feature_names=colnames(sites_mat)),
+             feature_names=feat_names),
         file.path(OUT_MOD_IND,"svm_preprocess_params.rds"))
 
-# ── 4. GRID SEARCH — FOLD-1 SCREENING ────────────────────────
+# ── 3. GRID SEARCH — FOLD-1 SCREENING ────────────────────────
 
-cat("--- Grid Search: Fold-1 Screening (20 combos) ---\n\n")
+cat("--- Grid Search: Fold-1 Screening (30 combos) ---\n")
+cat("  Convergence tracked — converged models preferred\n\n")
 
-C_grid     <- c(0.01, 0.1, 1, 10, 100)
-sigma_grid <- c(0.001, 0.01, 0.1, 1)
+# Refined grid: focus on sigma=0.05-0.5 (productive region)
+C_grid     <- c(0.1, 1, 10, 50, 100, 500)
+sigma_grid <- c(0.01, 0.05, 0.1, 0.5, 1.0)
 
-# Fold-1 training/test split
-tr_idx_s <- which(site_folds_c != 1)
-tr_idx_b <- which(bg_folds_c   != 1)
-ts_idx_s <- which(site_folds_c == 1)
-ts_idx_b <- which(bg_folds_c   == 1)
+# Fold-1 split
+tr_s <- which(site_folds_c!=1); tr_b <- which(bg_folds_c!=1)
+ts_s <- which(site_folds_c==1); ts_b <- which(bg_folds_c==1)
 
-tr_mat  <- rbind(sites_mat[tr_idx_s,], bg_mat[tr_idx_b,])
-tr_resp <- factor(c(rep("pos",length(tr_idx_s)),
-                    rep("neg",length(tr_idx_b))),
-                  levels=c("neg","pos"))
-ts_mat_s <- sites_mat[ts_idx_s,]
-ts_mat_b <- bg_mat[ts_idx_b,]
+tr_mat <- rbind(sites_mat[tr_s,], bg_mat[tr_b,])
+tr_lab <- factor(c(rep("pos",length(tr_s)),
+                   rep("neg",length(tr_b))),
+                 levels=c("neg","pos"))
 
-screen_res <- data.frame(
-  C=numeric(), sigma=numeric(), fold1_auc=numeric(),
-  stringsAsFactors=FALSE)
-
-n_combo <- 0
-t0 <- proc.time()
+screen_res <- data.frame(C=numeric(),sigma=numeric(),
+                         fold1_auc=numeric(),
+                         converged=logical(),
+                         stringsAsFactors=FALSE)
+t0 <- proc.time(); n <- 0
 
 for (C in C_grid) {
-  for (sigma in sigma_grid) {
-    n_combo <- n_combo + 1
-    cat(sprintf("  [%02d/20] C=%-6.3f sigma=%-6.4f ... ",
-                n_combo, C, sigma))
+  for (sig in sigma_grid) {
+    n <- n+1
+    cat(sprintf("  [%02d/30] C=%6.1f sigma=%5.3f ... ",
+                n, C, sig))
     
-    m <- tryCatch(
-      kernlab::ksvm(tr_mat, tr_resp,
-                    type       = "C-svc",
-                    kernel     = "rbfdot",
-                    kpar       = list(sigma=sigma),
-                    C          = C,
-                    prob.model = TRUE,
-                    scaled     = FALSE),
-      error=function(e) NULL
-    )
+    res <- fit_svm_tracked(tr_mat, tr_lab, C, sig, CW)
+    conv_sym <- if (res$converged) "✓" else "!"
     
-    if (is.null(m)) {
+    if (is.null(res$model)) {
       cat("FAILED\n")
       screen_res <- rbind(screen_res,
-                          data.frame(C=C,sigma=sigma,fold1_auc=NA_real_,
-                                     stringsAsFactors=FALSE))
+                          data.frame(C=C,sigma=sig,fold1_auc=NA_real_,
+                                     converged=FALSE,stringsAsFactors=FALSE))
     } else {
       ps <- tryCatch(
-        kernlab::predict(m, ts_mat_s, type="probabilities")[,"pos"],
-        error=function(e) rep(NA_real_,nrow(ts_mat_s)))
+        kernlab::predict(res$model, sites_mat[ts_s,],
+                         type="probabilities")[,"pos"],
+        error=function(e) rep(NA_real_,length(ts_s)))
       pb <- tryCatch(
-        kernlab::predict(m, ts_mat_b, type="probabilities")[,"pos"],
-        error=function(e) rep(NA_real_,nrow(ts_mat_b)))
-      auc_f1 <- calc_auc(ps[is.finite(ps)],
-                         pb[is.finite(pb)])
-      cat(sprintf("AUC=%.4f\n", auc_f1))
+        kernlab::predict(res$model, bg_mat[ts_b,],
+                         type="probabilities")[,"pos"],
+        error=function(e) rep(NA_real_,length(ts_b)))
+      auc_f1 <- calc_auc(ps, pb)
+      cat(sprintf("%s AUC=%.4f\n", conv_sym, auc_f1))
       screen_res <- rbind(screen_res,
-                          data.frame(C=C,sigma=sigma,fold1_auc=auc_f1,
+                          data.frame(C=C,sigma=sig,fold1_auc=auc_f1,
+                                     converged=res$converged,
                                      stringsAsFactors=FALSE))
-      rm(m, ps, pb)
+      rm(res,ps,pb)
     }
     gc(full=TRUE)
   }
 }
 
-cat(sprintf("\n  Phase 1 done in %.1f min\n",
+cat(sprintf("\n  Phase 1: %.1f min\n",
             (proc.time()-t0)[3]/60))
-rm(tr_mat, tr_resp, ts_mat_s, ts_mat_b); gc(full=TRUE)
 
-screen_res <- screen_res[
-  order(-screen_res$fold1_auc, na.last=TRUE),]
-cat("\n  Top 10 by fold-1 AUC:\n")
-cat(sprintf("  %-8s %-8s  %s\n","C","sigma","AUC"))
-cat("  ", paste(rep("-",25),collapse=""), "\n")
+rm(tr_mat,tr_lab); gc(full=TRUE)
+
+# Sort: converged first, then by AUC
+screen_res <- screen_res[order(
+  !screen_res$converged,
+  -screen_res$fold1_auc,
+  na.last=TRUE),]
+
+cat("\n  Top 10 (✓=converged, !=not converged):\n")
+cat(sprintf("  %-7s %-7s  %-8s  %s\n",
+            "C","sigma","AUC","Conv"))
+cat("  ", paste(rep("-",32),collapse=""), "\n")
 for (i in seq_len(min(10,nrow(screen_res)))) {
-  cat(sprintf("  %-8.3f %-8.4f  %.4f\n",
-              screen_res$C[i],screen_res$sigma[i],
-              screen_res$fold1_auc[i]))
+  r     <- screen_res[i,]
+  auc_s <- if (is.na(r$fold1_auc)) "—" else
+    sprintf("%.4f", r$fold1_auc)
+  cat(sprintf("  %-7.2f %-7.4f  %-8s  %s\n",
+              r$C, r$sigma, auc_s,
+              if(r$converged) "✓" else "!"))
 }
 
-# ── 5. FULL CV ON TOP 5 ──────────────────────────────────────
+# ── 4. FULL CV ON TOP 5 (CONVERGED PREFERRED) ───────────────
 
 cat("\n--- Full 5-Fold CV (top 5 candidates) ---\n\n")
 
-top5 <- head(screen_res[!is.na(screen_res$fold1_auc),],5)
+top5 <- head(screen_res[!is.na(screen_res$fold1_auc),], 5)
 
 cv_grid <- data.frame(C=numeric(),sigma=numeric(),
-                      cv_auc_mean=numeric(),cv_auc_sd=numeric(),
+                      cv_auc_mean=numeric(),
+                      cv_auc_sd=numeric(),
+                      n_converged=integer(),
                       stringsAsFactors=FALSE)
 
-for (row_i in seq_len(nrow(top5))) {
-  C_i     <- top5$C[row_i]
-  sig_i   <- top5$sigma[row_i]
-  cat(sprintf("  C=%-6.3f sigma=%-6.4f :", C_i, sig_i))
-  fa <- numeric(5)
+for (r in seq_len(nrow(top5))) {
+  C_i   <- top5$C[r]; sig_i <- top5$sigma[r]
+  cat(sprintf("  C=%6.1f sigma=%.3f :", C_i, sig_i))
+  fa <- numeric(5); n_conv <- 0L
   
   for (f in 1:5) {
-    tr_mat_f <- rbind(sites_mat[site_folds_c!=f,],
-                      bg_mat[bg_folds_c!=f,])
-    tr_r_f   <- factor(
+    tr_f <- rbind(sites_mat[site_folds_c!=f,],
+                  bg_mat[bg_folds_c!=f,])
+    lb_f <- factor(
       c(rep("pos",sum(site_folds_c!=f)),
         rep("neg",sum(bg_folds_c!=f))),
       levels=c("neg","pos"))
-    ts_s_f <- sites_mat[site_folds_c==f,]
-    ts_b_f <- bg_mat[bg_folds_c==f,]
+    ts_sf <- sites_mat[site_folds_c==f,]
+    ts_bf <- bg_mat[bg_folds_c==f,]
     
-    m_f <- tryCatch(
-      kernlab::ksvm(tr_mat_f, tr_r_f,
-                    type="C-svc", kernel="rbfdot",
-                    kpar=list(sigma=sig_i), C=C_i,
-                    prob.model=TRUE, scaled=FALSE),
-      error=function(e) NULL)
+    res_f <- fit_svm_tracked(tr_f, lb_f, C_i, sig_i, CW)
+    if (res_f$converged) n_conv <- n_conv+1L
     
-    if (is.null(m_f)) { fa[f] <- NA_real_ } else {
-      ps_f <- tryCatch(
-        kernlab::predict(m_f,ts_s_f,type="probabilities")[,"pos"],
-        error=function(e) rep(NA_real_,nrow(ts_s_f)))
-      pb_f <- tryCatch(
-        kernlab::predict(m_f,ts_b_f,type="probabilities")[,"pos"],
-        error=function(e) rep(NA_real_,nrow(ts_b_f)))
-      fa[f] <- calc_auc(ps_f[is.finite(ps_f)],
-                        pb_f[is.finite(pb_f)])
-      rm(m_f,ps_f,pb_f)
+    if (!is.null(res_f$model)) {
+      ps <- tryCatch(
+        kernlab::predict(res_f$model,ts_sf,
+                         type="probabilities")[,"pos"],
+        error=function(e) rep(NA_real_,nrow(ts_sf)))
+      pb <- tryCatch(
+        kernlab::predict(res_f$model,ts_bf,
+                         type="probabilities")[,"pos"],
+        error=function(e) rep(NA_real_,nrow(ts_bf)))
+      fa[f] <- calc_auc(ps,pb)
+      rm(res_f,ps,pb)
+    } else {
+      fa[f] <- NA_real_
     }
-    rm(tr_mat_f,tr_r_f,ts_s_f,ts_b_f); gc(full=TRUE)
+    rm(tr_f,lb_f,ts_sf,ts_bf); gc(full=TRUE)
   }
   
   m_auc <- mean(fa,na.rm=TRUE); s_auc <- sd(fa,na.rm=TRUE)
-  cat(sprintf(" AUC=%.4f±%.4f\n",m_auc,s_auc))
+  cat(sprintf(" AUC=%.4f±%.4f  (%d/5 conv)\n",
+              m_auc, s_auc, n_conv))
   cv_grid <- rbind(cv_grid,
                    data.frame(C=C_i,sigma=sig_i,
                               cv_auc_mean=m_auc,cv_auc_sd=s_auc,
+                              n_converged=n_conv,
                               stringsAsFactors=FALSE))
 }
 
-cv_grid  <- cv_grid[order(-cv_grid$cv_auc_mean),]
+# Select best — prefer models where ≥3/5 folds converged
+cv_grid <- cv_grid[order(
+  -(cv_grid$n_converged >= 3),  # converged first
+  -cv_grid$cv_auc_mean),]
+
 best_C   <- cv_grid$C[1]
 best_sig <- cv_grid$sigma[1]
 
-cat(sprintf("\n  BEST: C=%.3f  sigma=%.4f  CV AUC=%.4f±%.4f\n\n",
-            best_C, best_sig,
-            cv_grid$cv_auc_mean[1], cv_grid$cv_auc_sd[1]))
+cat(sprintf("\n  BEST: C=%.1f  sigma=%.3f",
+            best_C, best_sig))
+cat(sprintf("  CV AUC=%.4f±%.4f  (%d/5 converged)\n\n",
+            cv_grid$cv_auc_mean[1], cv_grid$cv_auc_sd[1],
+            cv_grid$n_converged[1]))
 
 write.csv(merge(screen_res, cv_grid,
                 by=c("C","sigma"), all.x=TRUE),
           file.path(OUT_TABLES,"TableS_SVM_tuning.csv"),
           row.names=FALSE)
+cat("  ✓ TableS_SVM_tuning.csv\n\n")
 
-# ── 6. FINAL SVM MODEL ───────────────────────────────────────
+# ── 5. FINAL SVM MODEL ───────────────────────────────────────
 
 cat("--- Fitting Final SVM Model ---\n")
-cat(sprintf("  C=%.3f  sigma=%.4f  prob.model=TRUE\n\n",
-            best_C, best_sig))
+cat(sprintf("  C=%.1f  sigma=%.3f  class.weights: neg=1 pos=%.2f\n\n",
+            best_C, best_sig, SPW_SVM))
 
 all_mat  <- rbind(sites_mat, bg_mat)
 all_resp <- factor(c(rep("pos",N_PRES),rep("neg",N_BG)),
@@ -370,18 +407,13 @@ all_resp <- factor(c(rep("pos",N_PRES),rep("neg",N_BG)),
 set.seed(42)
 t0 <- proc.time()
 
-svm_model <- kernlab::ksvm(
-  all_mat, all_resp,
-  type       = "C-svc",
-  kernel     = "rbfdot",
-  kpar       = list(sigma=best_sig),
-  C          = best_C,
-  prob.model = TRUE,
-  scaled     = FALSE   # already scaled manually
-)
+final_res <- fit_svm_tracked(all_mat, all_resp,
+                             best_C, best_sig, CW)
+svm_model <- final_res$model
 
 cat(sprintf("  Done in %.1f min\n",
             (proc.time()-t0)[3]/60))
+cat("  Converged:", final_res$converged, "\n")
 cat("  Support vectors:", kernlab::nSV(svm_model), "\n")
 
 saveRDS(svm_model,
@@ -390,7 +422,7 @@ cat("  ✓ svm_model_final.rds\n\n")
 
 rm(all_mat, all_resp); gc(full=TRUE)
 
-# ── 7. 5-FOLD SPATIAL BLOCK CV ───────────────────────────────
+# ── 6. 5-FOLD SPATIAL BLOCK CV ───────────────────────────────
 
 cat("--- 5-Fold CV ---\n\n")
 
@@ -401,87 +433,76 @@ fold_aucs      <- numeric(5)
 for (f in 1:5) {
   cat(sprintf("  Fold %d: ", f))
   
-  tr_mat_f <- rbind(sites_mat[site_folds_c!=f,],
-                    bg_mat[bg_folds_c!=f,])
-  tr_r_f   <- factor(
+  tr_f <- rbind(sites_mat[site_folds_c!=f,],
+                bg_mat[bg_folds_c!=f,])
+  lb_f <- factor(
     c(rep("pos",sum(site_folds_c!=f)),
       rep("neg",sum(bg_folds_c!=f))),
     levels=c("neg","pos"))
   ts_s <- which(site_folds_c==f)
   ts_b <- which(bg_folds_c==f)
   
-  set.seed(42)
-  fold_svm <- kernlab::ksvm(
-    tr_mat_f, tr_r_f,
-    type="C-svc", kernel="rbfdot",
-    kpar=list(sigma=best_sig), C=best_C,
-    prob.model=TRUE, scaled=FALSE)
+  res_f <- fit_svm_tracked(tr_f, lb_f, best_C, best_sig, CW)
   
-  ps <- kernlab::predict(fold_svm,
-                         sites_mat[ts_s,],
-                         type="probabilities")[,"pos"]
-  pb <- kernlab::predict(fold_svm,
-                         bg_mat[ts_b,],
-                         type="probabilities")[,"pos"]
-  
-  cv_preds_sites[ts_s] <- ps
-  cv_preds_bg[ts_b]    <- pb
-  fold_aucs[f]         <- calc_auc(ps,pb)
-  
-  cat(sprintf("AUC=%.4f  (%d sites/%d bg)\n",
-              fold_aucs[f], length(ts_s), length(ts_b)))
-  
-  rm(fold_svm,tr_mat_f,tr_r_f,ps,pb); gc(full=TRUE)
+  if (!is.null(res_f$model)) {
+    ps <- tryCatch(
+      kernlab::predict(res_f$model, sites_mat[ts_s,],
+                       type="probabilities")[,"pos"],
+      error=function(e) rep(NA_real_,length(ts_s)))
+    pb <- tryCatch(
+      kernlab::predict(res_f$model, bg_mat[ts_b,],
+                       type="probabilities")[,"pos"],
+      error=function(e) rep(NA_real_,length(ts_b)))
+    cv_preds_sites[ts_s] <- ps
+    cv_preds_bg[ts_b]    <- pb
+    fold_aucs[f] <- calc_auc(ps,pb)
+    conv_sym <- if(res_f$converged)"✓" else "!"
+    cat(sprintf("AUC=%.4f %s  (%d sites/%d bg)\n",
+                fold_aucs[f], conv_sym,
+                length(ts_s), length(ts_b)))
+    rm(res_f,ps,pb)
+  } else {
+    cat("FAILED\n"); fold_aucs[f] <- NA_real_
+  }
+  rm(tr_f,lb_f); gc(full=TRUE)
 }
 
-cv_auc_mean <- mean(fold_aucs)
-cv_auc_sd   <- sd(fold_aucs)
+cv_auc_mean <- mean(fold_aucs, na.rm=TRUE)
+cv_auc_sd   <- sd(fold_aucs, na.rm=TRUE)
 cat(sprintf("\n  CV AUC: %.4f ± %.4f\n\n",
             cv_auc_mean, cv_auc_sd))
 
-# ── 8. TILED RASTER PREDICTION ───────────────────────────────
+# ── 7. TILED RASTER PREDICTION ───────────────────────────────
 
 cat("--- Tiled Raster Prediction (4 tiles) ---\n\n")
 
-# Preprocess parameters saved earlier — captured in closure
 svm_tile_fn <- function(model, data, ...) {
   result        <- rep(NA_real_, nrow(data))
   complete_rows <- complete.cases(data)
   if (!any(complete_rows)) return(result)
   
   d_sub <- data[complete_rows,,drop=FALSE]
-  
-  # Apply z-scaling to continuous columns
   for (col in names(scale_params)) {
-    if (col %in% names(d_sub)) {
+    if (col %in% names(d_sub))
       d_sub[[col]] <- (d_sub[[col]] -
                          scale_params[[col]]$mean) /
         scale_params[[col]]$sd
-    }
   }
-  
-  # One-hot encode categoricals
   for (col in cat_in_stack) {
-    if (col %in% names(d_sub)) {
+    if (col %in% names(d_sub))
       d_sub[[col]] <- factor(as.integer(d_sub[[col]]),
                              levels=raster_levels[[col]])
-    }
   }
+  mm <- tryCatch(model.matrix(~.-1, data=d_sub),
+                 error=function(e) NULL)
+  if (is.null(mm)) return(result)
   
-  # model.matrix — same encoding as training
-  mm <- tryCatch(
-    model.matrix(~.-1, data=d_sub),
-    error=function(e) NULL)
-  
-  if (is.null(mm) || ncol(mm)==0) return(result)
-  
-  # Align columns to training matrix
-  train_cols <- readRDS(
-    file.path(OUT_MOD_IND,"svm_preprocess_params.rds"))$feature_names
-  missing_cols <- setdiff(train_cols, colnames(mm))
-  for (mc in missing_cols) mm <- cbind(mm, setNames(
-    data.frame(rep(0,nrow(mm))), mc))
-  mm <- mm[, train_cols, drop=FALSE]
+  # Align columns
+  missing_c <- setdiff(feat_names, colnames(mm))
+  for (mc in missing_c)
+    mm <- cbind(mm, matrix(0, nrow=nrow(mm), ncol=1,
+                           dimnames=list(NULL,mc)))
+  mm <- mm[, feat_names, drop=FALSE]
   
   preds <- tryCatch(
     kernlab::predict(model, mm,
@@ -529,19 +550,23 @@ cat(sprintf("  Range: %.4f to %.4f (mean %.4f)\n",
 cat("  ✓ svm_pred_prob.tif\n\n")
 gc(full=TRUE)
 
-# ── 9. EVALUATION METRICS ────────────────────────────────────
+# ── 8. EVALUATION METRICS ────────────────────────────────────
 
 cat("--- Evaluation Metrics ---\n\n")
 
-full_ps  <- kernlab::predict(svm_model, sites_mat,
-                             type="probabilities")[,"pos"]
-full_pb  <- kernlab::predict(svm_model, bg_mat,
-                             type="probabilities")[,"pos"]
+full_ps  <- tryCatch(
+  kernlab::predict(svm_model, sites_mat,
+                   type="probabilities")[,"pos"],
+  error=function(e) rep(NA_real_,N_PRES))
+full_pb  <- tryCatch(
+  kernlab::predict(svm_model, bg_mat,
+                   type="probabilities")[,"pos"],
+  error=function(e) rep(NA_real_,N_BG))
 auc_full <- safe_scalar(calc_auc(full_ps,full_pb))
 
 boyce_val <- compute_boyce(
   c(cv_preds_sites,cv_preds_bg), cv_preds_sites)
-tss_val   <- compute_tss(
+tss_val <- compute_tss(
   obs  = c(rep(1,length(cv_preds_sites)),
            rep(0,length(cv_preds_bg))),
   pred = c(cv_preds_sites,cv_preds_bg))
@@ -567,11 +592,12 @@ cat(sprintf("  Support vectors:   %d\n",
 cat(sprintf("  Area > 0.5:        %.1f%%\n",100*area_pct))
 cat(sprintf("  Sites > 0.5:       %.1f%%\n",100*sites_pct))
 
-# ── 10. SAVE OUTPUTS ─────────────────────────────────────────
+# ── 9. SAVE OUTPUTS ──────────────────────────────────────────
 
 metrics_df <- data.frame(
   algorithm="SVM", kernel="RBF",
   C=best_C, sigma=best_sig,
+  class_wt_pos=round(SPW_SVM,3),
   n_sv=kernlab::nSV(svm_model),
   cv_auc_mean=sm(cv_auc_mean), cv_auc_sd=sm(cv_auc_sd),
   full_auc=sm(auc_full), boyce_index=sm(boyce_val),
@@ -592,7 +618,7 @@ saveRDS(list(site_preds=cv_preds_sites,
 cat("\n  ✓ svm_evaluation.csv\n")
 cat("  ✓ svm_cv_predictions.rds\n\n")
 
-# ── 11. FIGURE ───────────────────────────────────────────────
+# ── 10. FIGURE ───────────────────────────────────────────────
 
 cat("--- Diagnostic Figure ---\n")
 
@@ -600,8 +626,8 @@ png(file.path(OUT_FIG_MAIN,"Fig_SVM_prediction.png"),
     width=2400,height=2400,res=300)
 terra::plot(svm_raster,
             main=sprintf(
-              "SVM — Probability (Platt)\nCV AUC=%.4f±%.4f  C=%.3f  σ=%.4f",
-              cv_auc_mean,cv_auc_sd,best_C,best_sig),
+              "SVM (Platt) — Probability\nCV AUC=%.4f±%.4f  C=%.1f  σ=%.3f  wt=%.1f",
+              cv_auc_mean,cv_auc_sd,best_C,best_sig,SPW_SVM),
             col=viridisLite::viridis(100),range=c(0,1),axes=FALSE)
 terra::plot(boundary_vect,add=TRUE,border="white",lwd=0.8)
 terra::plot(terra::vect(sites_sf),add=TRUE,
@@ -609,12 +635,14 @@ terra::plot(terra::vect(sites_sf),add=TRUE,
 dev.off()
 cat("  ✓ Fig_SVM_prediction.png\n\n")
 
-# ── 12. SUMMARY ──────────────────────────────────────────────
+# ── 11. SUMMARY ──────────────────────────────────────────────
 
 cat("========================================\n")
 cat("SCRIPT 16 COMPLETE — SVM\n")
 cat("========================================\n")
-cat(sprintf("C=%.3f  sigma=%.4f\n", best_C, best_sig))
+cat(sprintf("C=%.1f  sigma=%.3f\n", best_C, best_sig))
+cat(sprintf("class.weights: neg=1  pos=%.2f (sqrt ratio)\n",
+            SPW_SVM))
 cat(sprintf("Support vectors: %d\n",
             kernlab::nSV(svm_model)))
 cat(sprintf("CV AUC:        %.4f ± %.4f\n",
@@ -623,6 +651,7 @@ cat(sprintf("Boyce Index:   %.4f\n", sm(boyce_val)))
 cat(sprintf("TSS:           %.4f\n", sm(tss_val)))
 cat(sprintf("Kvamme's Gain: %.4f\n", sm(kg)))
 cat("Output: Platt-calibrated probability [0,1] ✓\n")
+cat("Convergence tracked ✓\n")
 cat("Tiled prediction (4 tiles) ✓\n")
 cat("All I/O: E drive ✓\n")
 cat("\nNext: Run Script 17 — Ensemble\n")
