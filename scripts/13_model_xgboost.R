@@ -10,24 +10,31 @@
 # Script: 13 of 25
 # ============================================================
 # PARAMETERS (Research Design 5.7.3):
-#   nrounds:          tuned by xgb.cv with spatial folds
+#   objective:        binary:logistic
 #   max_depth:        6
-#   eta:              0.01
+#   eta:              0.05  (changed from 0.01)
 #   colsample_bytree: 0.8
 #   subsample:        0.8
 #   scale_pos_weight: N_background / N_presence
-#   objective:        binary:logistic
-#   alpha=0, lambda=1 (defaults)
+#   alpha=0, lambda=1
 #
-# NROUNDS TUNING FIX:
-#   Spatial block CV produces noisy fold-level AUC curves →
-#   early stopping can trigger prematurely → best_iteration
-#   returns NULL/empty. Fix:
-#   1. maximize=TRUE so xgb.cv correctly tracks AUC direction
-#   2. early_stopping_rounds=100 (more patience)
-#   3. Robust extraction: check best_iteration, then
-#      best_ntreelimit, then peak of evaluation log,
-#      then fallback to 300 if all fail.
+# FIX vs v1 (nrounds=16 underfitting issue):
+#   PROBLEM: xgb.cv with spatial blocks gives noisy test AUC
+#   curves. Early stopping at round 16 captured noise peak,
+#   not true optimal. With eta=0.01 and 16 rounds, the model
+#   barely moved from its prior — prediction range 0.42-0.57.
+#
+#   FIX 1: eta=0.01 → eta=0.05
+#   XGBoost converges 5× faster. Reaches meaningful
+#   discrimination in 50-300 rounds rather than 500-2000.
+#
+#   FIX 2: No early stopping in xgb.cv
+#   Run all 500 rounds. Select best_nrounds from PEAK of
+#   test_auc_mean curve (which.max on evaluation log).
+#   Apply minimum floor of 50 rounds — prevents trivial models.
+#
+#   RESULT EXPECTED: prediction range ~0.1-0.9 (vs 0.42-0.57),
+#   better spatial discrimination, CV AUC ≥ 0.70.
 # ============================================================
 
 # ── 0. SOURCE SCRIPT 01 ─────────────────────────────────────
@@ -78,22 +85,24 @@ compute_tss <- function(obs, pred,
 
 compute_boyce <- function(fit, obs, n_bins = 101) {
   fit <- fit[is.finite(fit)]; obs <- obs[is.finite(obs)]
-  if (length(fit)<10 || length(obs)<3) return(NA_real_)
-  breaks  <- seq(min(fit), max(fit), length.out=n_bins+1)
+  if (length(fit)<10||length(obs)<3) return(NA_real_)
+  breaks  <- seq(min(fit),max(fit),length.out=n_bins+1)
   bin_mid <- (breaks[-1]+breaks[-(n_bins+1)])/2
   pe <- sapply(seq_len(n_bins), function(i) {
-    n_p <- sum(obs>=breaks[i] & obs<=breaks[i+1])
-    n_a <- sum(fit>=breaks[i] & fit<=breaks[i+1])
+    n_p <- sum(obs>=breaks[i]&obs<=breaks[i+1])
+    n_a <- sum(fit>=breaks[i]&fit<=breaks[i+1])
     if (n_a==0) return(NA_real_)
     (n_p/length(obs))/(n_a/length(fit))
   })
-  valid <- is.finite(pe) & pe>0
+  valid <- is.finite(pe)&pe>0
   if (sum(valid)<3) return(NA_real_)
-  safe_scalar(cor(bin_mid[valid], pe[valid],
-                  method="spearman", use="complete.obs"))
+  safe_scalar(cor(bin_mid[valid],pe[valid],
+                  method="spearman",use="complete.obs"))
 }
 
 calc_auc <- function(ps, pb) {
+  ps <- ps[is.finite(ps)]; pb <- pb[is.finite(pb)]
+  if (length(ps)==0||length(pb)==0) return(NA_real_)
   as.numeric(pROC::auc(
     pROC::roc(c(rep(1,length(ps)),rep(0,length(pb))),
               c(ps,pb), quiet=TRUE)))
@@ -144,9 +153,10 @@ bg_vals      <- bg_vals[bg_ok, ]
 site_folds_c <- site_folds[sites_ok]
 bg_folds_c   <- bg_folds[bg_ok]
 
-# XGBoost: all columns must be numeric (double)
 cat_predictors <- c("Geology","Geomorphology")
 cat_in_stack   <- cat_predictors[cat_predictors %in% final_names]
+
+# XGBoost: all numeric
 for (col in cat_in_stack) {
   sites_vals[[col]] <- as.numeric(as.integer(sites_vals[[col]]))
   bg_vals[[col]]    <- as.numeric(as.integer(bg_vals[[col]]))
@@ -164,20 +174,21 @@ SPW    <- N_BG / N_PRES
 cat(sprintf("  Sites: %d  Background: %d  SPW: %.2f\n\n",
             N_PRES, N_BG, SPW))
 
-# ── 3. XGBOOST PARAMETERS ────────────────────────────────────
+# ── 3. PARAMETERS ────────────────────────────────────────────
 
 cat("--- XGBoost Parameters ---\n")
-cat("  objective: binary:logistic\n")
-cat("  max_depth: 6  |  eta: 0.01\n")
+cat("  objective:        binary:logistic\n")
+cat("  max_depth:        6\n")
+cat("  eta:              0.05  (converges in ~100-300 rounds)\n")
 cat("  colsample_bytree: 0.8  |  subsample: 0.8\n")
 cat(sprintf("  scale_pos_weight: %.2f\n", SPW))
-cat("  nrounds: tuned by xgb.cv\n\n")
+cat("  nrounds:          tuned from xgb.cv peak (no early stop)\n\n")
 
 xgb_params <- list(
   objective        = "binary:logistic",
   eval_metric      = "auc",
   max_depth        = 6L,
-  eta              = 0.01,
+  eta              = 0.05,
   colsample_bytree = 0.8,
   subsample        = 0.8,
   scale_pos_weight = SPW,
@@ -187,17 +198,17 @@ xgb_params <- list(
   nthread          = 1L
 )
 
-# ── 4. TUNE NROUNDS — ROBUST EXTRACTION ──────────────────────
+# ── 4. TUNE NROUNDS — NO EARLY STOPPING ──────────────────────
 
-cat("--- Tuning nrounds via xgb.cv ---\n")
-cat("  maximize=TRUE  early_stopping=100\n\n")
+cat("--- Tuning nrounds via xgb.cv (500 rounds, no early stop) ---\n")
+cat("  Peak of mean test AUC selects optimal rounds\n")
+cat("  Minimum floor: 50 rounds\n\n")
 
 all_lab <- c(rep(1.0, N_PRES), rep(0.0, N_BG))
 all_mat <- rbind(sites_mat, bg_mat)
 storage.mode(all_mat) <- "double"
 
 combined_folds <- c(site_folds_c, bg_folds_c)
-# xgb.cv folds: list of TEST row indices per fold
 xgb_folds <- lapply(1:5, function(f)
   which(combined_folds == f))
 
@@ -210,81 +221,60 @@ set.seed(42)
 t0 <- proc.time()
 
 cv_result <- xgboost::xgb.cv(
-  params                = xgb_params,
-  data                  = dtrain_full,
-  nrounds               = 1000,
-  folds                 = xgb_folds,
-  early_stopping_rounds = 100,
-  maximize              = TRUE,   # AUC: higher is better
-  verbose               = 0
+  params    = xgb_params,
+  data      = dtrain_full,
+  nrounds   = 500,
+  folds     = xgb_folds,
+  maximize  = TRUE,
+  verbose   = 0
+  # NO early_stopping_rounds — run all 500, pick peak from log
 )
 
-cat(sprintf("  xgb.cv time: %.1f min\n",
+cat(sprintf("  xgb.cv done in %.1f min\n",
             (proc.time()-t0)[3]/60))
 
-# ── ROBUST NROUNDS EXTRACTION ──────────────────────────────
-# Tries 4 sources in order; falls back to peak of log; then 300
+# Extract nrounds from peak of evaluation log
+log_df   <- cv_result$evaluation_log
+auc_col  <- grep("test_auc_mean", names(log_df), value=TRUE)[1]
 
-best_nrounds <- NULL
-
-# Source 1: best_iteration (xgboost >= 1.6)
-if (!is.null(cv_result$best_iteration) &&
-    length(cv_result$best_iteration) > 0 &&
-    !is.na(cv_result$best_iteration) &&
-    cv_result$best_iteration >= 1) {
-  best_nrounds <- as.integer(cv_result$best_iteration)
-  cat("  best_iteration:", best_nrounds, "\n")
+if (!is.null(auc_col) && !is.na(auc_col)) {
+  auc_vals     <- log_df[[auc_col]]
+  peak_idx     <- which.max(auc_vals)
+  best_nrounds <- as.integer(log_df$iter[peak_idx])
+  peak_auc     <- auc_vals[peak_idx]
+  cat(sprintf("  Peak test AUC: %.4f at round %d\n",
+              peak_auc, best_nrounds))
+} else {
+  best_nrounds <- 200L
+  cat("  ⚠ Could not find AUC column — using 200 rounds\n")
 }
 
-# Source 2: best_ntreelimit (older xgboost)
-if (is.null(best_nrounds) &&
-    !is.null(cv_result$best_ntreelimit) &&
-    length(cv_result$best_ntreelimit) > 0 &&
-    !is.na(cv_result$best_ntreelimit) &&
-    cv_result$best_ntreelimit >= 1) {
-  best_nrounds <- as.integer(cv_result$best_ntreelimit)
-  cat("  best_ntreelimit:", best_nrounds, "\n")
-}
-
-# Source 3: peak of evaluation log
-if (is.null(best_nrounds) &&
-    !is.null(cv_result$evaluation_log) &&
-    nrow(cv_result$evaluation_log) > 0) {
-  log_df      <- cv_result$evaluation_log
-  auc_col     <- grep("test_auc_mean", names(log_df), value=TRUE)
-  if (length(auc_col) > 0) {
-    best_nrounds <- as.integer(
-      log_df$iter[which.max(log_df[[auc_col[1]]])])
-    cat("  Peak AUC at iteration:", best_nrounds, "\n")
-  }
-}
-
-# Source 4: fallback default
-if (is.null(best_nrounds) || best_nrounds < 1) {
-  best_nrounds <- 300L
-  cat("  ⚠ best_iteration not found — using default:", 
-      best_nrounds, "\n")
-}
-
-# Report xgb.cv AUC
-if (!is.null(cv_result$evaluation_log) &&
-    nrow(cv_result$evaluation_log) > 0) {
-  log_df  <- cv_result$evaluation_log
-  auc_col <- grep("test_auc_mean", names(log_df), value=TRUE)
-  if (length(auc_col) > 0) {
-    best_cv_auc <- max(log_df[[auc_col[1]]], na.rm=TRUE)
-    cat(sprintf("  Best xgb.cv AUC: %.4f\n", best_cv_auc))
-  }
-}
-
+# Floor: minimum 50 rounds to ensure meaningful model
+best_nrounds <- max(best_nrounds, 50L)
 cat(sprintf("  nrounds to use: %d\n\n", best_nrounds))
+
+# Plot AUC curve summary
+if (exists("auc_col") && !is.na(auc_col)) {
+  auc_at_50  <- if (nrow(log_df)>=50)
+    log_df[[auc_col]][50] else NA
+  auc_at_100 <- if (nrow(log_df)>=100)
+    log_df[[auc_col]][100] else NA
+  auc_at_200 <- if (nrow(log_df)>=200)
+    log_df[[auc_col]][200] else NA
+  cat(sprintf("  AUC curve: iter50=%.4f iter100=%.4f",
+              safe_scalar(auc_at_50),
+              safe_scalar(auc_at_100)))
+  cat(sprintf(" iter200=%.4f peak=%.4f@%d\n\n",
+              safe_scalar(auc_at_200), peak_auc,
+              best_nrounds))
+}
 
 rm(cv_result); gc(full=TRUE)
 
 # ── 5. FIT FINAL XGBOOST MODEL ───────────────────────────────
 
 cat("--- Fitting Final XGBoost Model ---\n")
-cat(sprintf("  nrounds = %d\n", best_nrounds))
+cat(sprintf("  nrounds=%d  eta=0.05\n", best_nrounds))
 
 set.seed(42)
 t0 <- proc.time()
@@ -315,7 +305,7 @@ rm(dtrain_full, all_mat, all_lab); gc(full=TRUE)
 
 # ── 6. 5-FOLD SPATIAL BLOCK CV ───────────────────────────────
 
-cat("--- 5-Fold CV ---\n\n")
+cat("--- 5-Fold Spatial Block CV ---\n\n")
 
 cv_preds_sites <- numeric(N_PRES)
 cv_preds_bg    <- numeric(N_BG)
@@ -358,8 +348,7 @@ for (f in 1:5) {
   cat(sprintf("AUC=%.4f  (%d sites/%d bg)\n",
               fold_aucs[f], length(ts_s), length(ts_b)))
   
-  rm(fold_xgb, dtr, tr_mat, tr_lab, ps, pb,
-     ts_s_mat, ts_b_mat)
+  rm(fold_xgb,dtr,tr_mat,tr_lab,ps,pb,ts_s_mat,ts_b_mat)
   gc(full=TRUE)
 }
 
@@ -386,7 +375,6 @@ cat("  ✓ xgboost_importance.csv\n\n")
 
 cat("--- Tiled Raster Prediction (4 tiles) ---\n\n")
 
-# NA-safe XGBoost predict wrapper for terra
 xgb_predict_safe <- function(model, data, ...) {
   result        <- rep(NA_real_, nrow(data))
   complete_rows <- complete.cases(data)
@@ -405,22 +393,18 @@ tile_paths <- character(4)
 
 for (i in 1:4) {
   cat(sprintf("  Tile %d/4 ... ", i))
-  te <- terra::ext(ext_full[1], ext_full[2],
+  te <- terra::ext(ext_full[1],ext_full[2],
                    ext_full[3]+(i-1)*y_step,
                    ext_full[3]+i*y_step)
   ts <- terra::crop(pred_stack, te)
   tile_paths[i] <- file.path("E:/R_temp",
                              sprintf("xgb_tile%d.tif",i))
   t0 <- proc.time()
-  
-  terra::predict(ts, xgb_model,
-                 fun       = xgb_predict_safe,
-                 na.rm     = FALSE,
-                 filename  = tile_paths[i],
-                 overwrite = TRUE,
-                 wopt      = list(datatype="FLT4S"))
-  
-  cat(sprintf("%.1f min\n", (proc.time()-t0)[3]/60))
+  terra::predict(ts, xgb_model, fun=xgb_predict_safe,
+                 na.rm=FALSE, filename=tile_paths[i],
+                 overwrite=TRUE,
+                 wopt=list(datatype="FLT4S"))
+  cat(sprintf("%.1f min\n",(proc.time()-t0)[3]/60))
   rm(ts); gc(full=TRUE)
 }
 
@@ -457,13 +441,11 @@ full_pb  <- predict(xgb_model,
 auc_full <- safe_scalar(calc_auc(full_ps, full_pb))
 
 boyce_val <- compute_boyce(
-  fit = c(cv_preds_sites, cv_preds_bg),
-  obs = cv_preds_sites)
-
-tss_val <- compute_tss(
+  c(cv_preds_sites,cv_preds_bg), cv_preds_sites)
+tss_val   <- compute_tss(
   obs  = c(rep(1,length(cv_preds_sites)),
            rep(0,length(cv_preds_bg))),
-  pred = c(cv_preds_sites, cv_preds_bg))
+  pred = c(cv_preds_sites,cv_preds_bg))
 
 area_cells <- terra::global(!is.na(xgb_raster),
                             "sum",na.rm=TRUE)[1,1]
@@ -490,20 +472,14 @@ cat(sprintf("  Sites > 0.5:       %.1f%%\n",100*sites_pct))
 metrics_df <- data.frame(
   algorithm    = "XGBoost",
   nrounds      = best_nrounds,
-  eta          = 0.01, max_depth = 6,
+  eta          = 0.05, max_depth=6,
   scale_pos_wt = round(SPW,2),
-  cv_auc_mean  = sm(cv_auc_mean),
-  cv_auc_sd    = sm(cv_auc_sd),
-  full_auc     = sm(auc_full),
-  boyce_index  = sm(boyce_val),
-  tss_max      = sm(tss_val),
-  kvamme_gain  = sm(kg),
-  fold1_auc    = sm(fold_aucs[1]),
-  fold2_auc    = sm(fold_aucs[2]),
-  fold3_auc    = sm(fold_aucs[3]),
-  fold4_auc    = sm(fold_aucs[4]),
-  fold5_auc    = sm(fold_aucs[5]),
-  stringsAsFactors=FALSE
+  cv_auc_mean  = sm(cv_auc_mean), cv_auc_sd=sm(cv_auc_sd),
+  full_auc     = sm(auc_full), boyce_index=sm(boyce_val),
+  tss_max      = sm(tss_val),  kvamme_gain=sm(kg),
+  fold1_auc=sm(fold_aucs[1]), fold2_auc=sm(fold_aucs[2]),
+  fold3_auc=sm(fold_aucs[3]), fold4_auc=sm(fold_aucs[4]),
+  fold5_auc=sm(fold_aucs[5]), stringsAsFactors=FALSE
 )
 
 write.csv(metrics_df,
@@ -522,10 +498,10 @@ cat("  ✓ xgboost_cv_predictions.rds\n\n")
 cat("--- Diagnostic Figure ---\n")
 
 png(file.path(OUT_FIG_MAIN,"Fig_XGBoost_prediction.png"),
-    width=2400, height=2400, res=300)
+    width=2400,height=2400,res=300)
 terra::plot(xgb_raster,
             main=sprintf(
-              "XGBoost — Probability\nCV AUC=%.4f±%.4f  nrounds=%d",
+              "XGBoost — Probability\nCV AUC=%.4f±%.4f  nrounds=%d  eta=0.05",
               cv_auc_mean,cv_auc_sd,best_nrounds),
             col=viridisLite::viridis(100),range=c(0,1),axes=FALSE)
 terra::plot(boundary_vect,add=TRUE,border="white",lwd=0.8)
@@ -539,7 +515,7 @@ cat("  ✓ Fig_XGBoost_prediction.png\n\n")
 cat("========================================\n")
 cat("SCRIPT 13 COMPLETE — XGBoost\n")
 cat("========================================\n")
-cat(sprintf("nrounds=%d  eta=0.01  max_depth=6\n",
+cat(sprintf("nrounds=%d  eta=0.05  max_depth=6\n",
             best_nrounds))
 cat(sprintf("scale_pos_weight: %.1f\n", SPW))
 cat(sprintf("CV AUC:        %.4f ± %.4f\n",
@@ -550,5 +526,4 @@ cat(sprintf("Kvamme's Gain: %.4f\n", sm(kg)))
 cat("Output: probability [0,1] ✓\n")
 cat("Tiled prediction (4 tiles) ✓\n")
 cat("All I/O: E drive ✓\n")
-cat("\nNext: Run Script 14 — BRT\n")
 cat("========================================\n")
