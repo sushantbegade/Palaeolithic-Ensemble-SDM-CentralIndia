@@ -249,8 +249,8 @@ if (!is.null(auc_col) && !is.na(auc_col)) {
   cat("  ⚠ Could not find AUC column — using 200 rounds\n")
 }
 
-# Floor: minimum 50 rounds to ensure meaningful model
-best_nrounds <- max(best_nrounds, 50L)
+# Floor: minimum 100 rounds to ensure meaningful model
+best_nrounds <- max(best_nrounds, 100L)
 cat(sprintf("  nrounds to use: %d\n\n", best_nrounds))
 
 # Plot AUC curve summary
