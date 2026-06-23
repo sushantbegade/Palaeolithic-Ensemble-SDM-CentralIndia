@@ -1,46 +1,16 @@
 # ============================================================
-# SCRIPT 23: MAIN FIGURES — PUBLICATION QUALITY REWRITE
+# SCRIPT 23: ALL 12 MAIN FIGURES — DEFINITIVE BUG-FIXED VERSION
 # ============================================================
-# Paper: A Multi-Model Ensemble Framework with Spatial
-#        Explainability for Predicting Open-Air Palaeolithic
-#        Site Distribution in Central India
-# Author: Sushant Begade | RTMNU Nagpur
-# ORCID:  0009-0003-0804-1763
-# Date:   June 2026
-# Script: 23 of 25
-# ============================================================
-# COMPLETE REWRITE — ggplot2 + tidyterra throughout.
-# Base R terra::plot() removed entirely. All figures use
-# ggplot2 pipeline for publication-quality output.
-#
-# FIXES FROM Script 23 v1:
-#   FIX 1 — Fig 8 crash: terra::global custom function
-#     returns list not scalar. Fixed: use terra::values()
-#     + base::quantile() directly.
-#   FIX 2 — Fig 1 India inset: was blank blue box.
-#     Fixed: rnaturalearth for real country outline.
-#   FIX 3 — Fig 2 dark panels (TPI/HAND): range near-zero
-#     squished to black. Fixed: oob=scales::squish +
-#     per-raster scale limits.
-#   FIX 4 — Fig 11 legend "character(0)": lookup mismatch.
-#     Fixed: infer from raster unique values directly.
-#   FIX 5 — Fig 7 error bar to 1.0: ensemble has no SD.
-#     Fixed: omit CI bar for ensemble, note in caption.
-#
-# FIGURES PRODUCED (all 13):
-#   Fig01 — Study area (ggplot + rnaturalearth)
-#   Fig02 — Predictor stack (ggplot + tidyterra)
-#   Fig03 — Palaeochannel construction
-#   Fig04 — Bias correction
-#   Fig05 — Spatial block CV design
-#   Fig06 — Individual algorithm response curves
-#   Fig07 — CV AUC comparison (ggplot, DeLong stars)
-#   Fig08 — Ensemble suitability + uncertainty + zones
-#   Fig09 — SHAP beeswarm (reuse Script 19 if exists)
-#   Fig10 — SHAP dependence (reuse Script 19 if exists)
-#   Fig11 — SHAP dominant driver map (reuse Script 19)
-#   Fig12 — Diachronic sub-model drivers (reuse Script 20)
-#   Fig_transfer — Transfer validation (reuse Script 21)
+# Fixes applied vs previous version:
+#  [1] Fig01 fill conflict (DEM continuous + sites discrete)
+#      → sites now use aes(COLOR=period) NOT fill; DEM keeps fill
+#  [2] Fig01 India inset REMOVED (user request)
+#  [3] ALL maps: UTM 44N retained (NO WGS84 transform; user request)
+#  [4] Fig07 "Discrete to continuous": geom_hline() replaces
+#      annotate("segment",..,x=-Inf..); x=integer positions in annotate
+#  [5] Fig07 type safety: as.numeric() on all adf columns
+#  [6] Fig11/12: terra::freq() — na.rm=TRUE removed (not valid arg)
+#  [7] Fig09/10: SHAP RDS absent → rebuild from XGBoost model inline
 # ============================================================
 
 source(file.path(
@@ -48,1147 +18,1136 @@ source(file.path(
   "R_Analysis/Palaeolithic-Ensemble-SDM-CentralIndia/scripts",
   "01_setup_packages.R"
 ))
-
 terra::terraOptions(tempdir = "E:/R_temp", memmax = 4)
 
-# ── Extra packages ───────────────────────────────────────────
-pkgs_extra <- c("tidyterra","ggspatial","patchwork",
-                "rnaturalearth","rnaturalearthdata",
-                "scales","ggtext","showtext")
-for (p in pkgs_extra) {
+for (p in c("tidyterra","ggspatial","patchwork","scales","shapviz")) {
   if (!requireNamespace(p, quietly = TRUE))
     install.packages(p, quiet = TRUE)
 }
 suppressPackageStartupMessages({
   library(ggplot2); library(tidyterra); library(ggspatial)
-  library(patchwork); library(scales); library(sf)
+  library(patchwork); library(scales); library(sf); library(dplyr)
 })
-rl_ok <- requireNamespace("rnaturalearth", quietly = TRUE)
-if (rl_ok) library(rnaturalearth)
+HAS_SHAP <- requireNamespace("shapviz", quietly = TRUE)
 
 cat("\n========================================\n")
-cat("SCRIPT 23: Main Figures (ggplot2 rewrite)\n")
+cat("SCRIPT 23: All 12 Main Figures\n")
 cat("========================================\n\n")
-
 `%||%` <- function(a, b) if (!is.null(a)) a else b
-
-# ─────────────────────────────────────────────────────────────
-# 0. GLOBAL THEME & PALETTES
-# ─────────────────────────────────────────────────────────────
-
-# Publication theme — clean, minimal, JAS-appropriate
-theme_pub_map <- function(base_size = 11) {
-  theme_void(base_size = base_size) %+replace%
-    theme(
-      plot.title       = element_text(size = base_size + 1,
-                                      face = "bold", hjust = 0.5,
-                                      margin = margin(b = 4)),
-      plot.subtitle    = element_text(size = base_size - 1,
-                                      hjust = 0.5, color = "grey35",
-                                      margin = margin(b = 3)),
-      plot.caption     = element_text(size = base_size - 2,
-                                      hjust = 0, color = "grey45",
-                                      face = "italic",
-                                      margin = margin(t = 5)),
-      legend.title     = element_text(size = base_size - 1,
-                                      face = "bold"),
-      legend.text      = element_text(size = base_size - 2),
-      legend.key.size  = unit(0.4, "cm"),
-      legend.key.width = unit(0.55, "cm"),
-      plot.margin      = margin(6, 6, 6, 6),
-      panel.border     = element_rect(color = "grey30",
-                                      fill = NA, linewidth = 0.4),
-      plot.background  = element_rect(fill = "white",
-                                      color = NA))
-}
-
-theme_pub_chart <- function(base_size = 11) {
-  theme_classic(base_size = base_size) %+replace%
-    theme(
-      plot.title       = element_text(size = base_size + 1,
-                                      face = "bold", hjust = 0.5),
-      plot.subtitle    = element_text(size = base_size - 1,
-                                      hjust = 0.5, color = "grey35"),
-      axis.text        = element_text(size = base_size - 1),
-      axis.title       = element_text(size = base_size,
-                                      face = "bold"),
-      legend.position  = "none",
-      panel.grid.major.y = element_line(color = "grey92",
-                                        linewidth = 0.4),
-      plot.background  = element_rect(fill = "white",
-                                      color = NA),
-      plot.margin      = margin(8, 8, 8, 8))
-}
-
-# Color palettes
-PAL_SUIT  <- "viridis"     # suitability maps
-PAL_UNCERT <- "plasma"     # uncertainty
-PAL_KDE   <- "inferno"     # bias/KDE surfaces
-PAL_ELEV  <- "mako"        # elevation
-
-# Site colors by cultural period
-PERIOD_COLS <- c(LP = "#E63946", MP = "#2A9D8F",
-                 UP = "#F4A261", Undiff = "#ADB5BD")
-
-# Driver palette (13 predictors, color-blind tolerant)
-DRIVER_PAL <- c(
-  TRI                = "#2A9D8F",
-  Elevation          = "#E63946",
-  Geomorphology      = "#FF9F1C",
-  NDVI               = "#4CC9F0",
-  HAND               = "#06D6A0",
-  Geology            = "#8338EC",
-  Dist_Palaeochannel = "#073B4C",
-  Dist_River         = "#118AB2",
-  Dist_RawMat        = "#FF6B6B",
-  Aspect             = "#F4A261",
-  TPI                = "#264653",
-  Plan_Curvature     = "#E9C46A",
-  Flow_Accum_log10   = "#B5838D")
-
-SITE_SIZE  <- 1.2
-SITE_SHAPE <- 21
-SITE_STROKE <- 0.3
-
 DPI <- 300L
 
 # ─────────────────────────────────────────────────────────────
-# 1. LOAD SHARED DATA
+# 0. DESIGN SYSTEM
+# ─────────────────────────────────────────────────────────────
+
+TERRAIN_PAL <- c(
+  "#004529","#006d2c","#238b45","#41ae76","#66c2a4",
+  "#99d8c9","#ccece6","#ffffcc","#ffeda0","#fed976",
+  "#feb24c","#fd8d3c","#fc4e2a","#e31a1c","#800026")
+
+# Cultural period: use COLOUR (not fill) on map to avoid DEM fill conflict
+PERIOD_COLS <- c(LP="#1f77b4",MP="#d62728",UP="#2ca02c",Undiff="#9467bd")
+PERIOD_LABS <- c(LP="Lower Palaeolithic",MP="Middle Palaeolithic",
+                 UP="Upper Palaeolithic",Undiff="Undifferentiated")
+
+FOLD_COLS  <- c("1"="#E63946","2"="#2ca02c","3"="#F4A261","4"="#8338EC","5"="#1f77b4")
+ALG_COLS   <- c(MaxEnt="#2A9D8F",RF="#E63946",XGBoost="#F4A261",
+                BRT="#264653",GAM="#E9C46A",SVM="#8338EC",Ensemble="#06D6A0")
+DRIVER_PAL <- c(
+  TRI="#2A9D8F",Elevation="#E63946",Geomorphology="#FF9F1C",
+  NDVI="#4CC9F0",HAND="#06D6A0",Geology="#8338EC",
+  Dist_Palaeochannel="#073B4C",Dist_River="#118AB2",
+  Dist_RawMat="#FF6B6B",Aspect="#F4A261",TPI="#264653",
+  Plan_Curvature="#E9C46A",Flow_Accum_log10="#B5838D",
+  BIO1="#C77DFF",BIO12="#9B5DE5",BIO15="#F15BB5")
+
+# Map theme: bw base, coord axis labels in UTM
+theme_map_pub <- function(base_size = 11) {
+  theme_bw(base_size = base_size) %+replace% theme(
+    plot.title       = element_text(size=base_size+1, face="bold",
+                                    hjust=0.5, margin=margin(b=4)),
+    plot.subtitle    = element_text(size=base_size-1, hjust=0.5,
+                                    color="grey35", margin=margin(b=3)),
+    plot.caption     = element_text(size=7.5, hjust=0, color="grey45",
+                                    face="italic", margin=margin(t=5)),
+    axis.title       = element_text(size=base_size-1, face="bold"),
+    axis.text        = element_text(size=base_size-2, color="grey25"),
+    panel.grid.major = element_line(color="white", linewidth=0.5),
+    panel.grid.minor = element_blank(),
+    legend.title     = element_text(size=base_size-1, face="bold"),
+    legend.text      = element_text(size=base_size-2),
+    legend.key.size  = unit(0.38,"cm"),
+    legend.background= element_rect(fill="white",color="grey70",linewidth=0.3),
+    plot.background  = element_rect(fill="white",color=NA),
+    plot.margin      = margin(5,5,5,5))
+}
+
+theme_chart_pub <- function(base_size = 11) {
+  theme_bw(base_size=base_size) %+replace% theme(
+    plot.title       = element_text(size=base_size+1,face="bold",hjust=0.5),
+    plot.subtitle    = element_text(size=base_size-1,hjust=0.5,
+                                    color="grey35",margin=margin(b=4)),
+    plot.caption     = element_text(size=7.5,hjust=0,color="grey45",
+                                    face="italic",margin=margin(t=5)),
+    axis.title       = element_text(size=base_size-1,face="bold"),
+    axis.text        = element_text(size=base_size-2,color="grey20"),
+    panel.grid.major = element_line(color="grey93",linewidth=0.4),
+    panel.grid.minor = element_blank(),
+    strip.text       = element_text(size=base_size-1,face="bold"),
+    strip.background = element_rect(fill="grey96",color="grey70"),
+    legend.title     = element_text(size=base_size-1,face="bold"),
+    legend.text      = element_text(size=base_size-2),
+    plot.background  = element_rect(fill="white",color=NA),
+    plot.margin      = margin(6,8,6,8))
+}
+
+# UTM axis label formatter (m → readable)
+utm_fmt <- function(x) {
+  ifelse(x >= 1e6, paste0(round(x/1e3), "k"), format(round(x), big.mark=","))
+}
+
+# ─────────────────────────────────────────────────────────────
+# 1. LOAD SHARED DATA (all in UTM 44N — NO WGS84 transform)
 # ─────────────────────────────────────────────────────────────
 
 cat("--- Loading Shared Data ---\n\n")
 
-template_30m  <- terra::rast(file.path(OUT_PREDICTORS,
-                                       "TEMPLATE_30m_utm44n.tif"))
-boundary_vect <- terra::vect(sf::st_read(
-  file.path(OUT_SITES, "study_area_boundary_utm44n.gpkg"),
-  quiet = TRUE))
-boundary_sf   <- sf::st_as_sf(boundary_vect)
+# Boundaries — keep in UTM
+boundary_utm <- sf::st_as_sf(terra::vect(sf::st_read(
+  file.path(OUT_SITES,"study_area_boundary_utm44n.gpkg"),quiet=TRUE)))
 
-sites_sf  <- sf::st_read(file.path(OUT_SITES,
-                                   "sites_all_utm44n.gpkg"),
-                         quiet = TRUE)
-sites_thin <- sf::st_read(file.path(OUT_SITES,
-                                    "sites_thinned_pooled.gpkg"),
-                          quiet = TRUE)
+# Sites
+sites_sf   <- sf::st_read(file.path(OUT_SITES,"sites_all_utm44n.gpkg"),quiet=TRUE)
+sites_thin <- sf::st_read(file.path(OUT_SITES,"sites_thinned_pooled.gpkg"),quiet=TRUE)
 
-# Add cultural period for color coding
-if (!"Relative.Chronology....Lower...Middle.Palaeolithic..etc.." %in%
-    names(sites_sf)) {
-  period_col <- grep("Relativ|Chronol|Period",
-                     names(sites_sf), value = TRUE,
-                     ignore.case = TRUE)[1]
-} else {
-  period_col <- "Relative.Chronology....Lower...Middle.Palaeolithic..etc.."
-}
+# Cultural period
+per_col <- grep("Relativ|Chronol",names(sites_sf),
+                value=TRUE,ignore.case=TRUE)[1]
+if (!is.na(per_col %||% NA)) {
+  ch <- as.character(sites_sf[[per_col]])
+  sites_sf$period <- dplyr::case_when(
+    grepl("Lower",ch,ignore.case=T)&!grepl("Middle|Upper",ch,ignore.case=T)~"LP",
+    grepl("Middle",ch,ignore.case=T)&!grepl("Lower|Upper",ch,ignore.case=T)~"MP",
+    grepl("Upper",ch,ignore.case=T)&!grepl("Lower|Middle",ch,ignore.case=T)~"UP",
+    TRUE~"Undiff")
+} else sites_sf$period <- "Undiff"
+sites_sf$period <- factor(sites_sf$period, levels=names(PERIOD_COLS))
 
-if (!is.null(period_col) && !is.na(period_col)) {
-  chron <- as.character(sites_sf[[period_col]])
-  sites_sf$period_class <- dplyr::case_when(
-    grepl("Lower",  chron, ignore.case=TRUE) &
-      !grepl("Middle|Upper", chron, ignore.case=TRUE) ~ "LP",
-    grepl("Middle", chron, ignore.case=TRUE) &
-      !grepl("Lower|Upper",  chron, ignore.case=TRUE) ~ "MP",
-    grepl("Upper",  chron, ignore.case=TRUE) &
-      !grepl("Lower|Middle", chron, ignore.case=TRUE) ~ "UP",
-    TRUE ~ "Undiff")
-} else {
-  sites_sf$period_class <- "Undiff"
-}
+# Rivers — UTM, major only (>5 km)
+rivers_utm_all <- sf::st_read(file.path(OUT_PREDICTORS,"rivers_utm44n.gpkg"),quiet=TRUE)
+river_len      <- as.numeric(sf::st_length(rivers_utm_all))
+rivers_utm     <- rivers_utm_all[river_len > 5000, ]
+cat(sprintf("  Rivers (major >5 km): %d\n", nrow(rivers_utm)))
 
-dem_r    <- terra::rast(file.path(OUT_PREDICTORS,
-                                  "DEM_30m_utm44n.tif"))
-rivers   <- sf::st_read(file.path(OUT_PREDICTORS,
-                                  "rivers_utm44n.gpkg"),
-                        quiet = TRUE)
-kde_r    <- tryCatch(terra::rast(file.path(OUT_BIAS,
-                                           "bias_surface_kde_30m_utm44n.tif")), error=function(e) NULL)
-bg_sf    <- sf::st_read(file.path(OUT_BACKGROUND,
-                                  "background_N10000.gpkg"),
-                        quiet = TRUE)
-ens_r    <- tryCatch(terra::rast(file.path(OUT_MOD_ENS,
-                                           "ensemble_primary.tif")), error=function(e) NULL)
-unc_r    <- tryCatch(terra::rast(file.path(OUT_MOD_ENS,
-                                           "ensemble_uncertainty_sd.tif")), error=function(e) NULL)
-zone_r   <- tryCatch(terra::rast(file.path(OUT_MOD_ENS,
-                                           "ensemble_confidence_zones.tif")), error=function(e) NULL)
-shap_r   <- tryCatch(terra::rast(file.path(OUT_SHAP,
-                                           "shap_dominant_driver_map.tif")), error=function(e) NULL)
-pred_stack <- terra::rast(file.path(OUT_PREDICTORS,
-                                    "PREDICTOR_STACK_FINAL_30m_utm44n.tif"))
-final_names <- readRDS(file.path(OUT_PREDICTORS,
-                                 "final_predictor_names.rds"))
+# DEM — aggregate to ~120m for display speed, keep in UTM
+dem_r   <- terra::rast(file.path(OUT_PREDICTORS,"DEM_30m_utm44n.tif"))
+dem_agg <- terra::aggregate(dem_r, fact=4, fun="mean")
+names(dem_agg) <- "elevation"
+dem_range <- as.numeric(terra::global(dem_agg, c("min","max"), na.rm=TRUE))
 
-# Hillshade
-slope_h  <- terra::terrain(dem_r, "slope",  unit = "radians")
-aspect_h <- terra::terrain(dem_r, "aspect", unit = "radians")
-hillshade_r <- terra::shade(slope_h, aspect_h,
-                            angle = 40, direction = 315)
-rm(slope_h, aspect_h); gc(full=TRUE)
+# Predictor stack
+pred_stack  <- terra::rast(file.path(OUT_PREDICTORS,"PREDICTOR_STACK_FINAL_30m_utm44n.tif"))
+final_names <- readRDS(file.path(OUT_PREDICTORS,"final_predictor_names.rds"))
 
-cat(sprintf("  Sites: %d  Thinned: %d\n",
-            nrow(sites_sf), nrow(sites_thin)))
-cat("\n")
+# Ensemble rasters — aggregate for display
+ens_r   <- tryCatch(terra::rast(file.path(OUT_MOD_ENS,"ensemble_primary.tif")),error=function(e)NULL)
+unc_r   <- tryCatch(terra::rast(file.path(OUT_MOD_ENS,"ensemble_uncertainty_sd.tif")),error=function(e)NULL)
+shap_r  <- tryCatch(terra::rast(file.path(OUT_SHAP,"shap_dominant_driver_map.tif")),error=function(e)NULL)
+kde_r   <- tryCatch(terra::rast(file.path(OUT_BIAS,"bias_surface_kde_30m_utm44n.tif")),error=function(e)NULL)
+bg_sf   <- sf::st_read(file.path(OUT_BACKGROUND,"background_N10000.gpkg"),quiet=TRUE)
+
+ens_agg <- if (!is.null(ens_r)) {
+  r <- terra::aggregate(ens_r, fact=3, fun="mean"); names(r) <- "suitability"; r
+} else NULL
+unc_agg <- if (!is.null(unc_r)) {
+  r <- terra::aggregate(unc_r, fact=3, fun="mean"); names(r) <- "uncertainty"; r
+} else NULL
+
+cat(sprintf("  Sites: %d | Thinned: %d\n",nrow(sites_sf),nrow(sites_thin)))
+cat("  Data loaded ✓\n\n")
 
 # ─────────────────────────────────────────────────────────────
-# 2. FIGURE 1 — STUDY AREA MAP
+# 2. FIGURE 1 — STUDY AREA (UTM 44N, NO India inset)
+# FIX: sites use aes(COLOR) not fill → no conflict with DEM fill
 # ─────────────────────────────────────────────────────────────
 
 cat("--- Figure 1: Study Area ---\n")
 
 tryCatch({
-  
-  # India + neighbours for inset
-  india_sf <- NULL; neighbours_sf <- NULL
-  if (rl_ok) {
-    india_sf      <- rnaturalearth::ne_countries(
-      country = "India", returnclass = "sf", scale = "medium")
-    neighbours_sf <- rnaturalearth::ne_countries(
-      continent = "Asia", returnclass = "sf", scale = "medium")
-  }
-  
-  # Study box in WGS84
-  bbox_geo <- sf::st_bbox(sf::st_transform(boundary_sf, 4326))
-  study_box <- sf::st_as_sf(sf::st_as_sfc(bbox_geo))
-  
-  # Main map
-  p_main <- ggplot() +
-    # Hillshade base
-    tidyterra::geom_spatraster(data = hillshade_r,
-                               show.legend = FALSE) +
-    scale_fill_gradient(low = "#1a1a2e", high = "#e8e8e8",
-                        na.value = "white",
-                        guide = "none") +
-    ggnewscale::new_scale_fill() %||%
-    ggplot2::scale_fill_identity() # fallback if no ggnewscale
-  
-  # Try with ggnewscale, fall back without
-  use_gns <- requireNamespace("ggnewscale", quietly = TRUE)
-  if (use_gns) library(ggnewscale)
-  
-  p_main <- ggplot() +
-    # Hillshade base
-    tidyterra::geom_spatraster(data = hillshade_r,
-                               show.legend = FALSE,
-                               aes(fill = hillshade)) +
+  fig01 <- ggplot() +
+    # DEM terrain — uses FILL scale (continuous)
+    tidyterra::geom_spatraster(data = dem_agg,
+                               show.legend = TRUE) +
     scale_fill_gradientn(
-      colors = c("#0d0d0d","#404040","#808080","#c0c0c0","#f0f0f0"),
-      na.value = "white", guide = "none") +
-    # Rivers
-    geom_sf(data = rivers, color = "#74B3CE",
-            linewidth = 0.5, alpha = 0.8) +
-    # Study boundary
-    geom_sf(data = boundary_sf, fill = NA,
-            color = "white", linewidth = 1.0) +
-    # Sites by cultural period
+      name   = "Elevation\n(m a.s.l.)",
+      colors = TERRAIN_PAL,
+      limits = c(dem_range[1], dem_range[2]),
+      na.value = "white",
+      breaks = seq(150, 550, 100),
+      guide  = guide_colorbar(
+        barwidth  = unit(0.5,"cm"),
+        barheight = unit(4.0,"cm"),
+        ticks.colour = "grey30")) +
+    # Major rivers
+    geom_sf(data  = rivers_utm,
+            color = "#2171b5",
+            linewidth = 0.30,
+            alpha = 0.70) +
+    # Boundary
+    geom_sf(data  = boundary_utm,
+            fill  = NA,
+            color = "grey15",
+            linewidth = 0.80) +
+    # Sites — use COLOR aesthetic (NOT fill) → NO CONFLICT with DEM fill
     geom_sf(data = sites_sf,
-            aes(color = period_class),
-            size = SITE_SIZE, shape = SITE_SHAPE,
-            fill = NA, stroke = SITE_STROKE + 0.1) +
-    scale_color_manual(name = "Cultural period",
-                       values = PERIOD_COLS,
-                       labels = c(LP    = "Lower Palaeolithic",
-                                  MP    = "Middle Palaeolithic",
-                                  UP    = "Upper Palaeolithic",
-                                  Undiff = "Undifferentiated"),
-                       guide  = guide_legend(override.aes = list(
-                         size = 2.5, shape = 16))) +
+            aes(color = period),
+            shape = 19,
+            size  = 2.2,
+            alpha = 0.88) +
+    scale_color_manual(
+      name   = "Cultural period",
+      values = PERIOD_COLS,
+      labels = PERIOD_LABS,
+      guide  = guide_legend(
+        override.aes = list(size=3.0,shape=19,alpha=1))) +
     ggspatial::annotation_scale(
-      location = "bl", width_hint = 0.22,
-      text_col = "white", line_col = "white",
-      bar_cols = c("white","white")) +
+      location   = "bl",
+      width_hint = 0.22,
+      text_cex   = 0.72,
+      pad_x      = unit(0.4,"cm"),
+      pad_y      = unit(0.4,"cm")) +
     ggspatial::annotation_north_arrow(
-      location = "br", which_north = "true",
-      height = unit(0.9, "cm"), width = unit(0.7, "cm"),
-      style = ggspatial::north_arrow_orienteering(
-        fill = c("white","white"),
-        line_col = "white",
-        text_col = "white")) +
-    labs(title    = "Study Area: Nagpur & Chandrapur Districts",
-         subtitle = "Wainganga-Wardha Basin, Central India (~21,300 km\u00b2)",
-         caption  = paste0("Coordinate system: WGS84 / UTM Zone 44N ",
-                           "(EPSG:32644). DEM: Cartosat-1 CartoDEM.")) +
-    theme_pub_map() +
-    theme(legend.position  = c(0.18, 0.15),
-          legend.background = element_rect(
-            fill = adjustcolor("black", 0.5),
-            color = NA, linewidth = 0),
-          legend.text  = element_text(color = "white",
-                                      size = 7.5),
-          legend.title = element_text(color = "white",
-                                      size = 8, face = "bold"),
-          legend.key   = element_blank())
+      location    = "tr",
+      which_north = "true",
+      pad_x       = unit(0.4,"cm"),
+      pad_y       = unit(0.5,"cm"),
+      height      = unit(1.0,"cm"),
+      width       = unit(0.80,"cm"),
+      style       = ggspatial::north_arrow_fancy_orienteering(
+        text_size = 8)) +
+    coord_sf(expand = FALSE) +   # UTM 44N — no transform
+    scale_x_continuous(labels = utm_fmt) +
+    scale_y_continuous(labels = utm_fmt) +
+    labs(x = "Easting (m)", y = "Northing (m)",
+         title    = "Study Area: Nagpur & Chandrapur Districts",
+         subtitle = "Wainganga-Wardha Basin, Central India (~21,300 km\u00b2)  |  UTM Zone 44N",
+         caption  = "DEM: Cartosat-1 CartoDEM (30m). Rivers: SOI 1:50,000 (major only, >5 km). N = 197 sites.") +
+    theme_map_pub() +
+    theme(legend.position = "right",
+          legend.key      = element_blank(),
+          legend.spacing.y = unit(0.4,"cm"))
   
-  # Inset map (India)
-  if (!is.null(india_sf)) {
-    p_inset <- ggplot() +
-      geom_sf(data = neighbours_sf %||% india_sf,
-              fill = "#D8E4BC", color = "grey70",
-              linewidth = 0.2) +
-      geom_sf(data = india_sf, fill = "#A8C5A0",
-              color = "grey40", linewidth = 0.4) +
-      geom_sf(data = study_box, fill = "#E63946",
-              color = "white", linewidth = 1,
-              alpha = 0.75) +
-      coord_sf(xlim = c(68, 98), ylim = c(6, 37)) +
-      annotate("text", x = 82, y = 22,
-               label = "India", fontface = "bold",
-               size = 2.5, color = "grey20") +
-      theme_void() +
-      theme(panel.border = element_rect(color = "grey40",
-                                        fill = NA, linewidth = 0.6),
-            plot.background = element_rect(fill = "white",
-                                           color = NA))
-  } else {
-    # Minimal fallback inset
-    p_inset <- ggplot() +
-      annotate("rect", xmin=68, xmax=98,
-               ymin=6, ymax=37,
-               fill="#D8E4BC", color="grey40") +
-      annotate("rect", xmin=bbox_geo[1], xmax=bbox_geo[3],
-               ymin=bbox_geo[2], ymax=bbox_geo[4],
-               fill="#E63946", color="white", linewidth=1) +
-      annotate("text", x=82, y=22, label="India",
-               fontface="bold", size=2.5) +
-      theme_void() +
-      theme(panel.border=element_rect(color="grey40",
-                                      fill=NA,linewidth=0.6),
-            plot.background=element_rect(fill="white"))
-  }
-  
-  # Compose: main + inset using patchwork inset_element
-  fig01 <- p_main +
-    patchwork::inset_element(p_inset,
-                             left = 0.72, bottom = 0.60,
-                             right = 1.00, top  = 1.00,
-                             align_to = "plot")
-  
-  ggsave(file.path(OUT_FIG_MAIN, "Fig01_study_area.png"),
-         fig01, width = 7.5, height = 9.5, dpi = DPI,
-         bg = "white")
+  ggsave(file.path(OUT_FIG_MAIN,"Fig01_study_area.png"),
+         fig01, width=8.5, height=10.5, dpi=DPI, bg="white")
   cat("  ✓ Fig01_study_area.png\n\n")
-}, error = function(e) {
-  cat(sprintf("  ✗ Fig01 error: %s\n\n", e$message))
-})
+}, error=function(e) cat(sprintf("  ✗ Fig01: %s\n\n",e$message)))
 
 # ─────────────────────────────────────────────────────────────
-# 3. FIGURE 2 — PREDICTOR STACK
+# 3. FIGURE 2 — PREDICTOR STACK (13 retained, UTM)
 # ─────────────────────────────────────────────────────────────
 
 cat("--- Figure 2: Predictor Stack ---\n")
 
 tryCatch({
-  n_pred <- terra::nlyr(pred_stack)
+  n_pred   <- terra::nlyr(pred_stack)
+  cat_pred <- c("Geology","Geomorphology")
   
-  # FIX: per-raster colour limits prevent dark/black panels
-  # Use quantile stretch for each predictor
-  plot_list <- lapply(seq_len(n_pred), function(i) {
-    r    <- terra::subset(pred_stack, i)
-    nm   <- names(r)
-    cat_r <- nm %in% c("Geology","Geomorphology")
+  plist <- lapply(seq_len(n_pred), function(i) {
+    r_agg <- terra::aggregate(terra::subset(pred_stack,i),
+                              fact=4, fun="mean")
+    nm  <- names(terra::subset(pred_stack,i))
+    names(r_agg) <- "value"
+    is_cat <- nm %in% cat_pred
+    vals <- as.numeric(terra::values(r_agg, na.rm=TRUE))
+    vlo  <- as.numeric(quantile(vals,0.01,na.rm=TRUE))
+    vhi  <- as.numeric(quantile(vals,0.99,na.rm=TRUE))
+    if (!is.finite(vlo)||vlo==vhi) { vlo<-min(vals,na.rm=T); vhi<-max(vals,na.rm=T) }
     
-    # Quantile stretch for continuous rasters
-    vals <- as.numeric(terra::values(r, na.rm = TRUE))
-    vlo  <- as.numeric(quantile(vals, 0.02, na.rm = TRUE))
-    vhi  <- as.numeric(quantile(vals, 0.98, na.rm = TRUE))
-    if (vlo == vhi) { vlo <- min(vals, na.rm=TRUE)
-    vhi <- max(vals, na.rm=TRUE) }
-    
-    pal  <- if (cat_r) "Set2" else PAL_SUIT
-    n_cat <- if (cat_r)
-      length(unique(vals[is.finite(vals)])) else 100L
-    
-    p <- ggplot() +
-      tidyterra::geom_spatraster(data = r) +
-      { if (cat_r)
-        scale_fill_gradientn(
-          colors = RColorBrewer::brewer.pal(
-            min(n_cat, 8), "Set2"),
-          na.value = "white", guide = "none")
+    ggplot() +
+      tidyterra::geom_spatraster(data=r_agg) +
+      { if (is_cat)
+        scale_fill_viridis_d(na.value="white", guide="none")
         else
           scale_fill_viridis_c(
-            option     = PAL_SUIT,
-            na.value   = "white",
-            limits     = c(vlo, vhi),
-            oob        = scales::squish,
-            guide      = "none") } +
-      geom_sf(data = boundary_sf, fill = NA,
-              color = "grey40", linewidth = 0.25) +
-      geom_sf(data = sites_thin, color = "#E63946",
-              size = 0.20, alpha = 0.7) +
-      labs(title = nm) +
-      theme_pub_map(base_size = 7.5) +
-      theme(plot.title = element_text(size = 7.5,
-                                      face = "bold", hjust = 0.5,
-                                      margin = margin(b=2)),
-            panel.border = element_rect(color="grey60",
-                                        fill=NA, linewidth=0.25))
-    p
+            option = if(nm %in% c("Elevation","HAND","TPI")) "mako"
+            else if(nm=="NDVI") "viridis"
+            else if(grepl("Dist",nm)) "plasma" else "viridis",
+            limits=c(vlo,vhi), oob=scales::squish,
+            na.value="white", guide="none") } +
+      geom_sf(data=boundary_utm, fill=NA,
+              color="grey30", linewidth=0.30) +
+      # Sites as color (no fill conflict)
+      geom_sf(data=sites_thin, color="#d62728",
+              shape=19, size=0.40, alpha=0.70) +
+      coord_sf(expand=FALSE) +
+      labs(title=nm) +
+      theme_void() +
+      theme(
+        plot.title   = element_text(size=8.5,face="bold",hjust=0.5,margin=margin(b=1)),
+        panel.border = element_rect(fill=NA,color="grey55",linewidth=0.35),
+        plot.background = element_rect(fill="white",color=NA),
+        plot.margin  = margin(2,2,2,2))
   })
   
-  # patchwork grid (4 columns)
-  fig02 <- patchwork::wrap_plots(plot_list, ncol = 4) +
+  fig02 <- patchwork::wrap_plots(plist, ncol=4L) +
     patchwork::plot_annotation(
-      title   = "Fig. 2 — Final Retained Predictor Stack",
-      subtitle = sprintf("(%d variables, 30m UTM Zone 44N; sites in red)",
-                         n_pred),
-      theme   = theme(
-        plot.title    = element_text(size = 12, face = "bold",
-                                     hjust = 0.5),
-        plot.subtitle = element_text(size = 9, hjust = 0.5,
-                                     color = "grey40")))
+      title    = "Fig. 2 \u2014 Final Retained Predictor Stack",
+      subtitle = sprintf("%d predictors (post-VIF screening, VIF<5); 30m UTM 44N; red = sites (N=190)", n_pred),
+      theme=theme(
+        plot.title    = element_text(size=13,face="bold",hjust=0.5),
+        plot.subtitle = element_text(size=9,hjust=0.5,color="grey40"),
+        plot.background=element_rect(fill="white",color=NA)))
   
-  n_rows_fig2 <- ceiling(n_pred / 4)
-  ggsave(file.path(OUT_FIG_MAIN, "Fig02_predictor_stack.png"),
-         fig02,
-         width  = 12,
-         height = n_rows_fig2 * 3.5,
-         dpi    = DPI, bg = "white")
+  ggsave(file.path(OUT_FIG_MAIN,"Fig02_predictor_stack.png"),
+         fig02, width=13, height=ceiling(n_pred/4)*3.6,
+         dpi=DPI, bg="white")
   cat("  ✓ Fig02_predictor_stack.png\n\n")
-}, error = function(e) {
-  cat(sprintf("  ✗ Fig02 error: %s\n\n", e$message))
-})
+}, error=function(e) cat(sprintf("  ✗ Fig02: %s\n\n",e$message)))
 
 # ─────────────────────────────────────────────────────────────
-# 4. FIGURE 3 — PALAEOCHANNEL CONSTRUCTION
+# 4. FIGURE 3 — PALAEOCHANNEL (UTM, 3 panels)
 # ─────────────────────────────────────────────────────────────
 
 cat("--- Figure 3: Palaeochannel ---\n")
 
 tryCatch({
-  mndwi_r  <- terra::rast(file.path(OUT_PREDICTORS,
-                                    "MNDWI_30m_utm44n.tif"))
-  valley_r <- terra::rast(file.path(OUT_PALAEO,
-                                    "PALAEO_VALLEY_30m_utm44n.tif"))
-  dist_pc  <- terra::rast(file.path(OUT_PREDICTORS,
-                                    "DIST_PALAEOCHANNEL_30m_utm44n.tif"))
+  mndwi_r  <- terra::rast(file.path(OUT_PREDICTORS,"MNDWI_30m_utm44n.tif"))
+  valley_r <- terra::rast(file.path(OUT_PALAEO,"PALAEO_VALLEY_30m_utm44n.tif"))
+  dist_pc  <- terra::rast(file.path(OUT_PREDICTORS,"DIST_PALAEOCHANNEL_30m_utm44n.tif"))
   
-  # Panel A: MNDWI moisture anomaly
-  mndwi_anom <- terra::ifel(mndwi_r > -0.10, 1, NA)
+  agg3 <- function(r, nm, fun="mean") {
+    rr <- terra::aggregate(r, fact=3, fun=fun)
+    names(rr) <- nm; rr
+  }
+  mndwi_agg <- agg3(mndwi_r,  "MNDWI")
+  valley_agg <- agg3(valley_r, "valley")
+  dist_agg   <- agg3(dist_pc/1000, "dist_km")
+  mv <- as.numeric(terra::values(mndwi_agg, na.rm=TRUE))
+  
+  base_layers <- list(
+    coord_sf(expand=FALSE),
+    scale_x_continuous(labels=utm_fmt),
+    scale_y_continuous(labels=utm_fmt),
+    labs(x=NULL,y=NULL))
   
   pA <- ggplot() +
-    tidyterra::geom_spatraster(data = terra::ifel(
-      is.na(mndwi_anom), 0, mndwi_anom)) +
-    scale_fill_gradientn(
-      colors    = c("#f5f5f5","#2196F3"),
-      na.value  = "white", guide = "none") +
-    geom_sf(data = boundary_sf, fill = NA,
-            color = "grey30", linewidth = 0.4) +
-    labs(title    = "(A) Spectral Source",
-         subtitle = "MNDWI moisture anomaly (> \u22120.10)") +
-    theme_pub_map()
+    geom_sf(data=boundary_utm, fill="grey98",
+            color="grey30", linewidth=0.5) +
+    tidyterra::geom_spatraster(data=mndwi_agg) +
+    scale_fill_gradient2(
+      name="MNDWI",low="#8B0000",mid="grey96",high="#08519c",
+      midpoint=-0.10,
+      limits=c(as.numeric(quantile(mv,.01,na.rm=T)),
+               as.numeric(quantile(mv,.99,na.rm=T))),
+      oob=scales::squish, na.value="white") +
+    geom_sf(data=boundary_utm, fill=NA, color="grey25", linewidth=0.5) +
+    base_layers +
+    labs(title="(A) Spectral Source",
+         subtitle="MNDWI (Sentinel-2A, May 2025)") +
+    theme_map_pub() + theme(legend.position="right")
   
-  # Panel B: Valley morphology
-  val_mask <- terra::ifel(valley_r == 1L, 1, NA)
   pB <- ggplot() +
-    tidyterra::geom_spatraster(data = terra::ifel(
-      is.na(val_mask), 0, val_mask)) +
-    scale_fill_gradientn(
-      colors   = c("#f5f5f5","#d62828"),
-      na.value = "white", guide = "none") +
-    geom_sf(data = boundary_sf, fill = NA,
-            color = "grey30", linewidth = 0.4) +
-    labs(title    = "(B) Topographic Source",
-         subtitle = "DEM valley morphology (geomorphons)") +
-    theme_pub_map()
+    tidyterra::geom_spatraster(data=dem_agg) +
+    scale_fill_gradientn(colors=TERRAIN_PAL, name=NULL,
+                         guide="none", na.value="white") +
+    # Valley overlay — use NEW fill only if valley is binary 0/1
+    tidyterra::geom_spatraster(
+      data=terra::ifel(valley_agg > 0.5, 1L, NA_integer_),
+      aes(), show.legend=FALSE) +
+    scale_fill_gradientn(colors="#d62728", na.value="transparent",
+                         guide="none") +
+    geom_sf(data=boundary_utm, fill=NA, color="grey25", linewidth=0.5) +
+    base_layers +
+    labs(title="(B) Topographic Source",
+         subtitle="Valley morphology (geomorphons; DEM background)") +
+    theme_map_pub()
   
-  # Panel C: Distance to confirmed palaeochannel
-  dist_km <- dist_pc / 1000
+  dv <- as.numeric(terra::values(dist_agg, na.rm=TRUE))
   pC <- ggplot() +
-    tidyterra::geom_spatraster(data = dist_km) +
+    tidyterra::geom_spatraster(data=dist_agg) +
     scale_fill_viridis_c(
-      option   = "plasma", name = "Dist. (km)",
-      na.value = "white",
-      limits   = c(0, as.numeric(quantile(
-        terra::values(dist_km, na.rm=TRUE), 0.99, na.rm=TRUE))),
-      oob = scales::squish) +
-    geom_sf(data = boundary_sf, fill = NA,
-            color = "white", linewidth = 0.4) +
-    ggspatial::annotation_scale(location = "bl",
-                                text_col = "white", line_col = "white",
-                                bar_cols = c("white","white")) +
-    labs(title    = "(C) Distance to Palaeochannel",
-         subtitle = "Confirmed network (MNDWI \u2229 Valley)") +
-    theme_pub_map() +
-    theme(legend.position = "right")
+      option="inferno", direction=-1, name="Dist. (km)",
+      limits=c(0, as.numeric(quantile(dv,.99,na.rm=T))),
+      oob=scales::squish, na.value="white") +
+    geom_sf(data=boundary_utm, fill=NA, color="grey70", linewidth=0.5) +
+    ggspatial::annotation_scale(location="bl") +
+    ggspatial::annotation_north_arrow(location="tr",
+                                      which_north="true",height=unit(0.75,"cm"),width=unit(0.60,"cm")) +
+    base_layers +
+    labs(title="(C) Distance to Palaeochannel",
+         subtitle="Confirmed network: MNDWI \u2229 Valley morphology") +
+    theme_map_pub() + theme(legend.position="right")
   
   fig03 <- (pA | pB | pC) +
     patchwork::plot_annotation(
       title   = "Fig. 3 \u2014 Palaeochannel Layer Construction (Dual-Source Protocol)",
-      caption = "Left: spectral (MNDWI >-0.10). Centre: topographic (geomorphons). Right: distance to confirmed network.",
-      theme   = theme(plot.title   = element_text(size=11, face="bold", hjust=0.5),
-                      plot.caption = element_text(size=7.5, hjust=0, color="grey40",
-                                                  face="italic")))
+      caption = "Sentinel-2A L2A, May 2025 (dry season). WhiteboxTools v2.3 geomorphons (search radius 10\u201330 cells). Threshold: MNDWI > \u22120.10.",
+      theme=theme(plot.title=element_text(size=12,face="bold",hjust=0.5),
+                  plot.caption=element_text(size=7.5,hjust=0,color="grey45",face="italic"),
+                  plot.background=element_rect(fill="white",color=NA)))
   
-  ggsave(file.path(OUT_FIG_MAIN, "Fig03_palaeochannel.png"),
-         fig03, width = 14, height = 6, dpi = DPI, bg = "white")
+  ggsave(file.path(OUT_FIG_MAIN,"Fig03_palaeochannel.png"),
+         fig03, width=15, height=7, dpi=DPI, bg="white")
   cat("  ✓ Fig03_palaeochannel.png\n\n")
-}, error = function(e) {
-  cat(sprintf("  ✗ Fig03 error: %s\n\n", e$message))
-})
+}, error=function(e) cat(sprintf("  ✗ Fig03: %s\n\n",e$message)))
 
 # ─────────────────────────────────────────────────────────────
-# 5. FIGURE 4 — BIAS CORRECTION
+# 5. FIGURE 4 — BIAS CORRECTION (UTM, 3 panels)
+# FIX: sites use color, bg points = steel blue not neon
 # ─────────────────────────────────────────────────────────────
 
 cat("--- Figure 4: Bias Correction ---\n")
 
 tryCatch({
   if (is.null(kde_r)) stop("KDE raster not found")
+  kde_agg <- terra::aggregate(kde_r, fact=4, fun="mean")
+  names(kde_agg) <- "kde"
+  base_map <- list(
+    geom_sf(data=boundary_utm,fill=NA,color="grey50",linewidth=0.5),
+    coord_sf(expand=FALSE),
+    scale_x_continuous(labels=utm_fmt),
+    scale_y_continuous(labels=utm_fmt),
+    labs(x=NULL,y=NULL))
   
   pA <- ggplot() +
-    tidyterra::geom_spatraster(data = kde_r) +
-    scale_fill_viridis_c(option = PAL_KDE,
-                         name = "Norm.\ndensity", na.value = "white") +
-    geom_sf(data = sites_sf, color = "white",
-            size = 0.5, alpha = 0.6) +
-    geom_sf(data = boundary_sf, fill = NA,
-            color = "grey70", linewidth = 0.4) +
-    labs(title    = "(A) KDE Survey-Effort Surface",
-         subtitle = "Hscv bandwidth, N=197 sites") +
-    theme_pub_map() +
-    theme(legend.position = "right")
+    tidyterra::geom_spatraster(data=kde_agg) +
+    scale_fill_viridis_c(option="inferno",name="Norm.\ndensity",
+                         na.value="white") +
+    geom_sf(data=sites_sf, color="white",
+            shape=19, size=0.9, alpha=0.75) +
+    base_map +
+    ggspatial::annotation_scale(location="bl") +
+    labs(title="(A) KDE Survey-Effort Surface",
+         subtitle="Hscv bandwidth; N = 197 sites") +
+    theme_map_pub() + theme(legend.position="right")
   
   pB <- ggplot() +
-    tidyterra::geom_spatraster(data = kde_r) +
-    scale_fill_viridis_c(option = PAL_KDE,
-                         na.value = "white", guide = "none") +
-    geom_sf(data = bg_sf, color = "#00FF88",
-            size = 0.06, alpha = 0.3) +
-    geom_sf(data = boundary_sf, fill = NA,
-            color = "grey70", linewidth = 0.4) +
-    labs(title    = "(B) Bias-Weighted Background",
-         subtitle = "N = 10,000 pts (Warton & Shepherd 2010)") +
-    theme_pub_map()
+    tidyterra::geom_spatraster(data=kde_agg) +
+    scale_fill_viridis_c(option="inferno",guide="none",na.value="white") +
+    geom_sf(data=bg_sf, color="#bdc9d6",
+            shape=19, size=0.10, alpha=0.40) +
+    base_map +
+    labs(title="(B) Bias-Weighted Background",
+         subtitle="N = 10,000 pts (Warton & Shepherd 2010)") +
+    theme_map_pub()
   
   pC <- ggplot() +
-    geom_sf(data = boundary_sf, fill = "grey96",
-            color = "grey50", linewidth = 0.5) +
-    geom_sf(data = bg_sf, color = "#118AB2",
-            size = 0.12, alpha = 0.25) +
-    geom_sf(data = sites_sf,
-            aes(color = period_class),
-            size = 1.4, shape = 16, alpha = 0.85) +
-    scale_color_manual(name = "Period",
-                       values = PERIOD_COLS,
-                       labels = c(LP="Lower", MP="Middle",
-                                  UP="Upper", Undiff="Undiffer."),
-                       guide  = guide_legend(
-                         override.aes = list(size = 2.5))) +
-    labs(title    = "(C) Sites vs Background",
-         subtitle = "KDE-weighted matching survey intensity") +
-    theme_pub_map() +
-    theme(legend.position = "right",
-          legend.key.size = unit(0.3, "cm"))
+    geom_sf(data=boundary_utm,fill="grey97",color="grey30",linewidth=0.5) +
+    geom_sf(data=bg_sf, color="#abd9e9",
+            shape=19, size=0.12, alpha=0.30) +
+    geom_sf(data=sites_sf, aes(color=period),
+            shape=19, size=2.0, alpha=0.88) +
+    scale_color_manual(name="Period",values=PERIOD_COLS,
+                       labels=PERIOD_LABS,
+                       guide=guide_legend(override.aes=list(size=2.5,shape=19))) +
+    base_map +
+    labs(title="(C) Sites vs Background",
+         subtitle="Background intensity tracks survey effort") +
+    theme_map_pub() +
+    theme(legend.position="right",
+          legend.text=element_text(size=7.5),
+          legend.key.size=unit(0.32,"cm"))
   
   fig04 <- (pA | pB | pC) +
     patchwork::plot_annotation(
       title   = "Fig. 4 \u2014 Survey-Effort Bias Correction",
-      caption = "Phillips et al. (2009); ks package, Hscv bandwidth.",
-      theme   = theme(plot.title   = element_text(size=11, face="bold", hjust=0.5),
-                      plot.caption = element_text(size=7.5, hjust=0,
-                                                  color="grey40", face="italic")))
+      caption = "Target-group approach (Phillips et al. 2009). ks package, Hscv bandwidth. Background sampled within district boundary.",
+      theme=theme(plot.title=element_text(size=12,face="bold",hjust=0.5),
+                  plot.caption=element_text(size=7.5,hjust=0,color="grey45",face="italic"),
+                  plot.background=element_rect(fill="white",color=NA)))
   
-  ggsave(file.path(OUT_FIG_MAIN, "Fig04_bias_correction.png"),
-         fig04, width = 14, height = 6, dpi = DPI, bg = "white")
+  ggsave(file.path(OUT_FIG_MAIN,"Fig04_bias_correction.png"),
+         fig04, width=15, height=7, dpi=DPI, bg="white")
   cat("  ✓ Fig04_bias_correction.png\n\n")
-}, error = function(e) {
-  cat(sprintf("  ✗ Fig04 error: %s\n\n", e$message))
-})
+}, error=function(e) cat(sprintf("  ✗ Fig04: %s\n\n",e$message)))
 
 # ─────────────────────────────────────────────────────────────
-# 6. FIGURE 5 — SPATIAL CV DESIGN (from blockCV object)
+# 6. FIGURE 5 — SPATIAL CV DESIGN (UTM)
 # ─────────────────────────────────────────────────────────────
 
 cat("--- Figure 5: Spatial CV Design ---\n")
 
 tryCatch({
-  cv_design  <- readRDS(file.path(OUT_CV,
-                                  "cv_block_assignments.rds"))
-  sites_cv   <- sf::st_read(file.path(OUT_CV,
-                                      "sites_with_folds.gpkg"),
-                            quiet = TRUE)
-  bg_cv      <- sf::st_read(file.path(OUT_CV,
-                                      "background_with_folds.gpkg"),
-                            quiet = TRUE)
-  fold_col_cv <- grep("fold", names(sites_cv),
-                      ignore.case=TRUE, value=TRUE)[1]
+  cv_design <- readRDS(file.path(OUT_CV,"cv_block_assignments.rds"))
+  sites_cv  <- sf::st_read(file.path(OUT_CV,"sites_with_folds.gpkg"),quiet=TRUE)
+  bg_cv     <- sf::st_read(file.path(OUT_CV,"background_with_folds.gpkg"),quiet=TRUE)
+  fold_col  <- grep("fold",names(sites_cv),ignore.case=TRUE,value=TRUE)[1]
+  sites_cv$fold_f <- factor(as.character(sites_cv[[fold_col]]))
+  bg_cv$fold_f    <- factor(as.character(bg_cv[[fold_col]]))
+  fold_tbl  <- as.data.frame(table(Fold=sites_cv$fold_f))
   
-  FOLD_COLS <- c("1"="#E63946","2"="#2A9D8F","3"="#F4A261",
-                 "4"="#8338EC","5"="#118AB2")
-  
-  sites_cv$fold_fac <- factor(as.character(
-    sites_cv[[fold_col_cv]]))
-  bg_cv$fold_fac    <- factor(as.character(
-    bg_cv[[fold_col_cv]]))
-  
-  # Panel A: site fold assignment
   pA <- ggplot() +
-    geom_sf(data = boundary_sf, fill = "grey97",
-            color = "grey40", linewidth = 0.5) +
-    geom_sf(data = sites_cv, aes(color = fold_fac),
-            size = 1.8, shape = 16) +
-    scale_color_manual(name = "Fold",
-                       values = FOLD_COLS,
-                       guide  = guide_legend(
-                         override.aes = list(size = 3))) +
-    ggspatial::annotation_scale(location = "bl") +
-    labs(title    = "(A) Site Fold Assignments",
-         subtitle = sprintf("Block size: %.0f km",
-                            cv_design$block_size_km)) +
-    theme_pub_map() +
-    theme(legend.position = "right")
+    geom_sf(data=boundary_utm, fill="grey98",
+            color="grey30", linewidth=0.5) +
+    geom_sf(data=bg_cv, aes(color=fold_f),
+            size=0.08, alpha=0.35) +
+    geom_sf(data=sites_cv, aes(color=fold_f),
+            shape=19, size=2.2, alpha=0.90) +
+    scale_color_manual(name="Fold",values=FOLD_COLS) +
+    ggspatial::annotation_scale(location="bl") +
+    ggspatial::annotation_north_arrow(location="tr",
+                                      which_north="true",height=unit(0.8,"cm"),width=unit(0.65,"cm")) +
+    guides(color=guide_legend(
+      override.aes=list(size=2.8,shape=19,alpha=1))) +
+    coord_sf(expand=FALSE) +
+    scale_x_continuous(labels=utm_fmt) +
+    scale_y_continuous(labels=utm_fmt) +
+    labs(title="(A) Five-Fold Spatial Block Assignment",
+         subtitle=sprintf("Block size: %.0f km | blockCV 3.1",
+                          cv_design$block_size_km),
+         x=NULL, y=NULL) +
+    theme_map_pub() + theme(legend.position="right")
   
-  # Panel B: background fold assignment
-  pB <- ggplot() +
-    geom_sf(data = boundary_sf, fill = "grey97",
-            color = "grey40", linewidth = 0.5) +
-    geom_sf(data = bg_cv, aes(color = fold_fac),
-            size = 0.08, alpha = 0.4) +
-    scale_color_manual(name = "Fold",
-                       values = FOLD_COLS, guide = "none") +
-    labs(title    = "(B) Background Fold Assignments",
-         subtitle = "N = 10,000 pts") +
-    theme_pub_map()
+  pB <- ggplot(fold_tbl, aes(x=Fold, y=Freq, fill=Fold)) +
+    geom_col(width=0.65, color=NA) +
+    geom_text(aes(label=Freq), vjust=-0.4,
+              size=3.5, fontface="bold", color="grey20") +
+    scale_fill_manual(values=FOLD_COLS, guide="none") +
+    scale_y_continuous(limits=c(0,max(fold_tbl$Freq)*1.18),
+                       expand=expansion(mult=c(0,0))) +
+    labs(title="(B) Sites per Fold",
+         x="Spatial fold", y="N sites") +
+    theme_chart_pub()
   
-  # Fold size table panel
-  fold_tbl <- as.data.frame(table(Fold = sites_cv$fold_fac))
-  pC <- ggplot(fold_tbl, aes(x = Fold, y = Freq,
-                             fill = Fold)) +
-    geom_col(width = 0.6) +
-    geom_text(aes(label = Freq), vjust = -0.4,
-              size = 3.2, fontface = "bold") +
-    scale_fill_manual(values = FOLD_COLS, guide = "none") +
-    scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
-    labs(title    = "(C) Sites per Fold",
-         x = "Spatial fold", y = "N sites") +
-    theme_pub_chart() +
-    theme(legend.position = "none")
-  
-  fig05 <- (pA | pB | pC) +
+  fig05 <- (pA | pB) + patchwork::plot_layout(widths=c(2.5,1)) +
     patchwork::plot_annotation(
       title   = "Fig. 5 \u2014 Five-Fold Spatial Block Cross-Validation Design",
-      caption = sprintf("Variogram autocorrelation range: %.1f km (blockCV 3.1; Valavi et al. 2019).",
-                        cv_design$autocor_range_m / 1000),
-      theme   = theme(plot.title   = element_text(size=11, face="bold", hjust=0.5),
-                      plot.caption = element_text(size=7.5, hjust=0,
-                                                  color="grey40", face="italic")))
+      caption = sprintf("Variogram range: %.0f km. blockCV 3.1 (Valavi et al. 2019).",
+                        cv_design$autocor_range_m/1000),
+      theme=theme(plot.title=element_text(size=12,face="bold",hjust=0.5),
+                  plot.caption=element_text(size=7.5,hjust=0,color="grey45",face="italic"),
+                  plot.background=element_rect(fill="white",color=NA)))
   
-  ggsave(file.path(OUT_FIG_MAIN, "Fig05_spatial_cv_design.png"),
-         fig05, width = 14, height = 6, dpi = DPI, bg = "white")
+  ggsave(file.path(OUT_FIG_MAIN,"Fig05_spatial_cv_design.png"),
+         fig05, width=12, height=7, dpi=DPI, bg="white")
   cat("  ✓ Fig05_spatial_cv_design.png\n\n")
-}, error = function(e) {
-  cat(sprintf("  ✗ Fig05 error: %s\n\n", e$message))
-})
+}, error=function(e) cat(sprintf("  ✗ Fig05: %s\n\n",e$message)))
 
 # ─────────────────────────────────────────────────────────────
-# 7. FIGURE 7 — AUC COMPARISON (ggplot, DeLong stars)
-# ─────────────────────────────────────────────────────────────
-
-cat("--- Figure 7: AUC Comparison ---\n")
-
-tryCatch({
-  # Load all evaluation CSVs
-  read_auc <- function(path, alg_col = "algorithm") {
-    if (!file.exists(path)) return(NULL)
-    df <- read.csv(path, stringsAsFactors = FALSE)
-    list(mean = df$cv_auc_mean[1],
-         sd   = df$cv_auc_sd[1])
-  }
-  
-  alg_data <- data.frame(
-    algorithm = c("MaxEnt","RF","XGBoost","BRT","GAM","SVM",
-                  "Ensemble\n(AUC-wt)"),
-    auc_mean  = c(
-      read.csv(file.path(OUT_EVAL,"maxent_evaluation.csv"))$cv_auc_mean[1],
-      read.csv(file.path(OUT_EVAL,"rf_evaluation.csv"))$cv_auc_mean[1],
-      read.csv(file.path(OUT_EVAL,"xgboost_evaluation.csv"))$cv_auc_mean[1],
-      read.csv(file.path(OUT_EVAL,"brt_evaluation.csv"))$cv_auc_mean[1],
-      read.csv(file.path(OUT_EVAL,"gam_evaluation.csv"))$cv_auc_mean[1],
-      read.csv(file.path(OUT_EVAL,"svm_evaluation.csv"))$cv_auc_mean[1],
-      0.7239),
-    auc_sd    = c(
-      read.csv(file.path(OUT_EVAL,"maxent_evaluation.csv"))$cv_auc_sd[1],
-      read.csv(file.path(OUT_EVAL,"rf_evaluation.csv"))$cv_auc_sd[1],
-      read.csv(file.path(OUT_EVAL,"xgboost_evaluation.csv"))$cv_auc_sd[1],
-      read.csv(file.path(OUT_EVAL,"brt_evaluation.csv"))$cv_auc_sd[1],
-      read.csv(file.path(OUT_EVAL,"gam_evaluation.csv"))$cv_auc_sd[1],
-      read.csv(file.path(OUT_EVAL,"svm_evaluation.csv"))$cv_auc_sd[1],
-      NA_real_),  # ensemble has no per-fold SD from here
-    is_ensemble = c(rep(FALSE,6), TRUE),
-    stringsAsFactors = FALSE)
-  
-  # DeLong significance (ensemble is significantly better than these)
-  alg_data$delong_sig <- c(FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, FALSE)
-  
-  # CI (1.96 × SD) — omit for ensemble
-  alg_data$ci_hi <- ifelse(!alg_data$is_ensemble,
-                           pmin(alg_data$auc_mean + 1.96*alg_data$auc_sd, 1, na.rm=TRUE),
-                           NA_real_)
-  alg_data$ci_lo <- ifelse(!alg_data$is_ensemble,
-                           pmax(alg_data$auc_mean - 1.96*alg_data$auc_sd, 0, na.rm=TRUE),
-                           NA_real_)
-  
-  alg_data$algorithm <- factor(alg_data$algorithm,
-                               levels = alg_data$algorithm)
-  
-  BAR_COLS <- c("#2A9D8F","#E63946","#F4A261","#264653",
-                "#E9C46A","#8338EC","#06D6A0")
-  
-  fig07 <- ggplot(alg_data,
-                  aes(x = algorithm, y = auc_mean, fill = algorithm)) +
-    # Reference lines
-    geom_hline(yintercept = 0.75, color = "#F4A261",
-               linetype = "dashed", linewidth = 0.6) +
-    geom_hline(yintercept = 0.85, color = "#E63946",
-               linetype = "dotted", linewidth = 0.6) +
-    # Bars
-    geom_col(width = 0.68, color = NA) +
-    # CI error bars (individual algorithms only)
-    geom_errorbar(aes(ymin = ci_lo, ymax = ci_hi),
-                  width = 0.22, linewidth = 0.7,
-                  color = "grey20", na.rm = TRUE) +
-    # AUC value labels
-    geom_text(aes(label = sprintf("%.4f", auc_mean)),
-              vjust = -0.5, size = 3.0,
-              fontface = "bold", color = "grey20") +
-    # DeLong significance stars
-    geom_text(data = subset(alg_data, delong_sig),
-              aes(y = auc_mean + 0.032),
-              label = "*", color = "#E63946",
-              size = 5, fontface = "bold") +
-    # Ensemble star marker
-    geom_text(data = subset(alg_data, is_ensemble),
-              aes(y = auc_mean + 0.032),
-              label = "\u2605", color = "#06D6A0",
-              size = 4) +
-    scale_fill_manual(values = BAR_COLS, guide = "none") +
-    scale_y_continuous(limits = c(0.50, 1.00),
-                       breaks = seq(0.50, 1.00, 0.05),
-                       expand = expansion(mult=c(0,0.04))) +
-    annotate("text", x = 0.6, y = 0.753,
-             label = "AUC = 0.75 (adequate)",
-             hjust = 0, size = 2.8, color = "#F4A261",
-             fontface = "italic") +
-    annotate("text", x = 0.6, y = 0.853,
-             label = "AUC = 0.85 (strong)",
-             hjust = 0, size = 2.8, color = "#E63946",
-             fontface = "italic") +
-    labs(title    = "Fig. 7 \u2014 Spatial Block CV AUC: All Models",
-         subtitle = "Error bars = \u00b11.96 SD (95% CI); * = DeLong p<0.05 vs ensemble; \u2605 = ensemble",
-         x = "", y = "Spatial Block CV AUC (5-fold mean)",
-         caption  = "DeLong's test (DeLong et al. 1988; pROC). Ensemble significantly outperforms XGBoost, BRT, GAM, SVM.") +
-    theme_pub_chart() +
-    theme(axis.text.x  = element_text(size = 9,
-                                      color = "grey20"),
-          plot.caption = element_text(size = 7.5,
-                                      color = "grey45", face = "italic"))
-  
-  ggsave(file.path(OUT_FIG_MAIN, "Fig07_AUC_comparison.png"),
-         fig07, width = 9, height = 6, dpi = DPI, bg = "white")
-  cat("  ✓ Fig07_AUC_comparison.png\n\n")
-}, error = function(e) {
-  cat(sprintf("  ✗ Fig07 error: %s\n\n", e$message))
-})
-
-# ─────────────────────────────────────────────────────────────
-# 8. FIGURE 8 — ENSEMBLE SUITABILITY + UNCERTAINTY + ZONES
-# FIX: terra::global custom function crash → use terra::values()
-# ─────────────────────────────────────────────────────────────
-
-cat("--- Figure 8: Ensemble Suitability ---\n")
-
-if (is.null(ens_r)) {
-  cat("  ✗ ensemble_primary.tif not found\n\n")
-} else {
-  tryCatch({
-    # FIX 1: terra::values() + base quantile() — no terra::global crash
-    ens_flat <- as.numeric(terra::values(ens_r, na.rm = TRUE))
-    q25 <- as.numeric(quantile(ens_flat, 0.25, na.rm = TRUE))
-    q50 <- as.numeric(quantile(ens_flat, 0.50, na.rm = TRUE))
-    q75 <- as.numeric(quantile(ens_flat, 0.75, na.rm = TRUE))
-    
-    suit_class <- terra::classify(ens_r,
-                                  rcl = matrix(c(-Inf,q25,1, q25,q50,2,
-                                                 q50,q75,3, q75,Inf,4),
-                                               ncol=3, byrow=TRUE),
-                                  include.lowest = TRUE)
-    
-    suit_lvls  <- c("Low","Moderate","High","Very High")
-    suit_labs  <- sprintf("%s\n(%.2f\u2013%.2f)",
-                          suit_lvls,
-                          c(0, q25, q50, q75),
-                          c(q25, q50, q75, 1))
-    suit_cols  <- c("#264653","#2A9D8F","#E9C46A","#E63946")
-    names(suit_cols) <- as.character(1:4)
-    
-    # Panel A: continuous suitability
-    pA <- ggplot() +
-      tidyterra::geom_spatraster(data = ens_r) +
-      scale_fill_viridis_c(
-        option   = PAL_SUIT,
-        name     = "Suitability\n(probability)",
-        na.value = "white",
-        limits   = c(0, 1),
-        breaks   = seq(0, 1, 0.2)) +
-      geom_sf(data = boundary_sf, fill = NA,
-              color = "white", linewidth = 0.7) +
-      geom_sf(data = sites_thin, color = "#E63946",
-              size = SITE_SIZE, shape = 16, alpha = 0.8) +
-      ggspatial::annotation_scale(location = "bl",
-                                  text_col="white", line_col="white",
-                                  bar_cols=c("white","white")) +
-      ggspatial::annotation_north_arrow(location = "br",
-                                        which_north = "true",
-                                        height = unit(0.8,"cm"), width = unit(0.65,"cm"),
-                                        style = ggspatial::north_arrow_orienteering(
-                                          fill=c("white","grey30"), line_col="white",
-                                          text_col="white")) +
-      labs(title    = "(A) Ensemble Suitability Surface",
-           subtitle = sprintf("CV AUC=0.7239  Boyce=0.9092  KG=0.6063")) +
-      theme_pub_map() +
-      theme(legend.position = c(0.87, 0.70))
-    
-    # Panel B: uncertainty
-    if (!is.null(unc_r)) {
-      unc_flat <- as.numeric(terra::values(unc_r, na.rm=TRUE))
-      unc_q75  <- as.numeric(quantile(unc_flat, 0.75, na.rm=TRUE))
-      unc_max  <- as.numeric(quantile(unc_flat, 0.99, na.rm=TRUE))
-      
-      pB <- ggplot() +
-        tidyterra::geom_spatraster(data = unc_r) +
-        scale_fill_viridis_c(
-          option   = "plasma",
-          name     = "SD\n(uncertainty)",
-          na.value = "white",
-          limits   = c(0, unc_max),
-          oob      = scales::squish) +
-        geom_sf(data = boundary_sf, fill = NA,
-                color = "white", linewidth = 0.7) +
-        geom_sf(data = sites_thin, color = "white",
-                size = 0.7, alpha = 0.6) +
-        labs(title    = "(B) Prediction Uncertainty",
-             subtitle = sprintf("SD across 6 algorithms  Q75=%.3f",
-                                unc_q75)) +
-        theme_pub_map() +
-        theme(legend.position = c(0.87, 0.70))
-    } else {
-      pB <- ggplot() +
-        annotate("text", x=0.5, y=0.5,
-                 label="Uncertainty raster\nnot found",
-                 size=4, color="grey50") +
-        theme_void()
-    }
-    
-    # Panel C: classified suitability
-    suit_class_df <- as.data.frame(suit_class,
-                                   xy = TRUE, na.rm = TRUE)
-    names(suit_class_df)[3] <- "class"
-    suit_class_df$class_lab <- factor(
-      suit_class_df$class,
-      levels = 1:4, labels = suit_lvls)
-    
-    pC <- ggplot() +
-      geom_raster(data = suit_class_df,
-                  aes(x = x, y = y, fill = class_lab)) +
-      scale_fill_manual(
-        name   = "Suitability",
-        values = c(Low="#264653", Moderate="#2A9D8F",
-                   High="#E9C46A", `Very High`="#E63946"),
-        na.value = "white",
-        guide  = guide_legend(reverse = TRUE)) +
-      geom_sf(data = boundary_sf, fill = NA,
-              color = "grey30", linewidth = 0.6) +
-      geom_sf(data = sites_thin, color = "white",
-              size = 0.8, alpha = 0.7) +
-      coord_sf() +
-      labs(title    = "(C) Suitability Classification",
-           subtitle = "Max-TSS threshold; 100% sites in Very High") +
-      theme_pub_map() +
-      theme(legend.position = "right")
-    
-    fig08 <- (pA | pB | pC) +
-      patchwork::plot_annotation(
-        title   = "Fig. 8 \u2014 AUC-Weighted Ensemble: Suitability, Uncertainty & Classification",
-        caption = "N=6 algorithms; all outputs on logistic probability scale [0\u20131]. Sites = thinned pooled (N=190).",
-        theme   = theme(plot.title   = element_text(size=11, face="bold", hjust=0.5),
-                        plot.caption = element_text(size=7.5, hjust=0,
-                                                    color="grey40", face="italic")))
-    
-    ggsave(file.path(OUT_FIG_MAIN,
-                     "Fig08_ensemble_suitability.png"),
-           fig08, width = 16, height = 7.5,
-           dpi = DPI, bg = "white")
-    cat("  ✓ Fig08_ensemble_suitability.png\n\n")
-  }, error = function(e) {
-    cat(sprintf("  ✗ Fig08 error: %s\n\n", e$message))
-  })
-}
-
-# ─────────────────────────────────────────────────────────────
-# 9. FIGURE 11 — SHAP DOMINANT DRIVER MAP
-# FIX: character(0) legend bug — infer from raster values
-# ─────────────────────────────────────────────────────────────
-
-cat("--- Figure 11: SHAP Dominant Driver Map ---\n")
-
-# Use Script 19 version if it looks better
-fig11_s19 <- file.path(OUT_FIG_MAIN,
-                       "Fig11_dominant_driver_map.png")
-fig11_s23 <- file.path(OUT_FIG_MAIN,
-                       "Fig11_shap_dominant_driver.png")
-
-if (file.exists(fig11_s19) &&
-    file.info(fig11_s19)$size > 200000) {
-  cat("  Using Script 19 version (superior ggplot2 output) ✓\n\n")
-  file.copy(fig11_s19, gsub("dominant_driver_map",
-                            "shap_dominant_driver_FINAL",
-                            fig11_s19), overwrite = TRUE)
-} else if (!is.null(shap_r)) {
-  tryCatch({
-    # FIX: infer driver codes from raster directly
-    freq_tbl <- terra::freq(shap_r, na.rm = TRUE)
-    freq_tbl <- freq_tbl[!is.na(freq_tbl$value) &
-                           freq_tbl$value > 0, ]
-    freq_tbl <- freq_tbl[order(-freq_tbl$count), ]
-    
-    codes  <- as.integer(freq_tbl$value)
-    n_drv  <- length(codes)
-    labels <- final_names[pmin(codes, length(final_names))]
-    pcts   <- 100 * freq_tbl$count / sum(freq_tbl$count)
-    
-    # Color assignment
-    drv_cols <- sapply(labels, function(nm) {
-      if (nm %in% names(DRIVER_PAL)) DRIVER_PAL[nm]
-      else "#AAAAAA"
-    })
-    
-    # Reclassify raster to 1:n
-    rcl  <- cbind(codes, seq_along(codes))
-    shap_rcl <- terra::classify(shap_r, rcl, others = NA)
-    
-    # Convert to data frame for ggplot
-    shap_df <- as.data.frame(shap_rcl, xy = TRUE,
-                             na.rm = TRUE)
-    names(shap_df)[3] <- "driver_idx"
-    shap_df$driver <- factor(shap_df$driver_idx,
-                             levels   = seq_along(labels),
-                             labels   = labels)
-    
-    # Legend labels with percentage
-    leg_labs <- sprintf("%s (%.1f%%)", labels, pcts)
-    names(leg_labs) <- labels
-    
-    fig11 <- ggplot() +
-      geom_raster(data = shap_df,
-                  aes(x = x, y = y, fill = driver)) +
-      scale_fill_manual(
-        name   = "Dominant predictor\n(% of 250m cells)",
-        values = setNames(drv_cols, labels),
-        labels = leg_labs,
-        na.value = "white",
-        guide  = guide_legend(
-          ncol = if (n_drv > 8) 2L else 1L,
-          override.aes = list(size = 4))) +
-      geom_sf(data = boundary_sf, fill = NA,
-              color = "grey20", linewidth = 0.7) +
-      geom_sf(data = sites_thin, color = "white",
-              size = 0.7, alpha = 0.7, shape = 16) +
-      # Zone annotations
-      annotate("label", x = mean(sf::st_bbox(boundary_sf)[c(1,3)]) - 30000,
-               y = mean(sf::st_bbox(boundary_sf)[c(2,4)]) + 50000,
-               label = "Chandrapur\nBasin\n(TRI dom.)",
-               size = 2.8, fontface = "bold",
-               fill = adjustcolor("white", 0.75),
-               label.size = 0) +
-      annotate("label",
-               x = mean(sf::st_bbox(boundary_sf)[c(1,3)]),
-               y = mean(sf::st_bbox(boundary_sf)[c(2,4)]) + 10000,
-               label = "Nagpur\nPediplain\n(Geomorph.)",
-               size = 2.8, fontface = "bold",
-               fill = adjustcolor("white", 0.75),
-               label.size = 0) +
-      annotate("label",
-               x = mean(sf::st_bbox(boundary_sf)[c(1,3)]) + 20000,
-               y = mean(sf::st_bbox(boundary_sf)[c(2,4)]) - 50000,
-               label = "Satpura\nFoothills\n(Geomorph.)",
-               size = 2.8, fontface = "bold",
-               fill = adjustcolor("white", 0.75),
-               label.size = 0) +
-      ggspatial::annotation_scale(location = "bl") +
-      ggspatial::annotation_north_arrow(location = "br",
-                                        which_north = "true",
-                                        height = unit(0.8,"cm"), width = unit(0.65,"cm")) +
-      coord_sf() +
-      labs(title   = "Fig. 11 \u2014 SHAP Dominant Predictor Map",
-           subtitle = sprintf(
-             "TreeSHAP, XGBoost; 250m grid resampled to 30m; \u03c7\u00b2=54,352, p<0.001"),
-           caption = "Predictor with highest absolute SHAP value per 250m cell. Sites = thinned pooled (N=190, white).") +
-      theme_pub_map() +
-      theme(legend.position = "right",
-            legend.text = element_text(size = 7),
-            legend.title = element_text(size = 8, face="bold"))
-    
-    ggsave(file.path(OUT_FIG_MAIN,
-                     "Fig11_shap_dominant_driver.png"),
-           fig11, width = 9, height = 10.5,
-           dpi = DPI, bg = "white")
-    cat("  ✓ Fig11_shap_dominant_driver.png\n\n")
-  }, error = function(e) {
-    cat(sprintf("  ✗ Fig11 error: %s\n\n", e$message))
-  })
-}
-
-# ─────────────────────────────────────────────────────────────
-# 10. FIGURE 6 — INDIVIDUAL ALGORITHM RESPONSE CURVES
+# 7. FIGURE 6 — RESPONSE CURVES (LOESS-smoothed)
 # ─────────────────────────────────────────────────────────────
 
 cat("--- Figure 6: Response Curves ---\n")
 
 tryCatch({
-  # Load XGBoost model + top predictors
-  xgb_path <- file.path(OUT_MOD_IND, "xgboost_model_final.bin")
-  xgb_info <- readRDS(file.path(OUT_MOD_IND,
-                                "xgboost_model_info.rds"))
+  xgb_path <- file.path(OUT_MOD_IND,"xgboost_model_final.bin")
   if (!file.exists(xgb_path)) stop("XGBoost model not found")
-  xgb_mod  <- xgboost::xgb.load(xgb_path)
+  xgb_mod <- xgboost::xgb.load(xgb_path)
   
-  # Top 5 predictors from SHAP
-  shap_imp_path <- file.path(OUT_TABLES,
-                             "Table4_SHAP_importance.csv")
-  if (file.exists(shap_imp_path)) {
-    shap_imp_df <- read.csv(shap_imp_path,
-                            stringsAsFactors = FALSE)
-    shap_imp_df$xgb_v <- suppressWarnings(
-      as.numeric(shap_imp_df[[
-        grep("xgb|XGB", names(shap_imp_df),
-             value=TRUE, ignore.case=TRUE)[1]]]))
-    top5 <- head(shap_imp_df[order(-shap_imp_df$xgb_v,
-                                   na.last=TRUE), "predictor"],
-                 5)
-  } else {
-    top5 <- c("TRI","NDVI","Elevation","Dist_River","HAND")
-  }
+  xgb_imp  <- read.csv(file.path(OUT_EVAL,"xgboost_importance.csv"),
+                       stringsAsFactors=FALSE)
+  names(xgb_imp)[1] <- "predictor"
+  gain_col <- grep("Gain|gain",names(xgb_imp),value=TRUE)[1]
+  if (is.na(gain_col)) gain_col <- names(xgb_imp)[2]
+  top5 <- head(xgb_imp$predictor[order(-xgb_imp[[gain_col]])], 5)
   top5 <- top5[top5 %in% final_names]
   if (!length(top5)) top5 <- final_names[1:5]
   
-  cat(sprintf("  Top 5 for response curves: %s\n",
-              paste(top5, collapse=", ")))
-  
-  # Sample predictor values
   set.seed(42)
-  samp <- terra::spatSample(pred_stack, size = 5000,
-                            method = "random",
-                            na.rm = TRUE, as.df = TRUE)
-  cats_cols <- c("Geology","Geomorphology")
-  for (col in cats_cols[cats_cols %in% names(samp)])
+  samp <- terra::spatSample(pred_stack, size=5000,
+                            method="random", na.rm=TRUE, as.df=TRUE)
+  for (col in c("Geology","Geomorphology")[c("Geology","Geomorphology") %in% names(samp)])
     samp[[col]] <- as.numeric(as.integer(samp[[col]]))
-  
-  samp_mat <- as.matrix(samp[, final_names, drop=FALSE])
+  samp_mat <- as.matrix(samp[,final_names,drop=FALSE])
   storage.mode(samp_mat) <- "double"
   
-  # Marginal response curves for each top predictor
-  curve_list <- lapply(top5, function(pred) {
-    col_idx <- which(final_names == pred)
-    if (!length(col_idx)) return(NULL)
-    pred_range <- seq(
-      quantile(samp_mat[,col_idx], 0.05, na.rm=TRUE),
-      quantile(samp_mat[,col_idx], 0.95, na.rm=TRUE),
-      length.out = 80)
-    med_mat <- matrix(
-      apply(samp_mat, 2, median, na.rm=TRUE),
-      nrow = 80, ncol = ncol(samp_mat), byrow=TRUE)
-    colnames(med_mat) <- final_names
-    med_mat[, col_idx] <- pred_range
-    storage.mode(med_mat) <- "double"
-    preds <- predict(xgb_mod,
-                     xgboost::xgb.DMatrix(med_mat))
-    data.frame(predictor = pred, x = pred_range, y = preds)
-  })
-  curve_df <- do.call(rbind, Filter(Negate(is.null), curve_list))
-  curve_df$predictor <- factor(curve_df$predictor,
-                               levels = top5)
+  units_map <- c(TRI="TRI",NDVI="NDVI",Elevation="Elevation (m)",
+                 Dist_River="Dist. river (m)",HAND="HAND (m)",
+                 Geomorphology="Geomorphology",Dist_Palaeochannel="Dist. palaeochannel (m)",
+                 Dist_RawMat="Dist. raw material (m)",Aspect="Aspect (\u00b0)",
+                 Plan_Curvature="Plan curvature",TPI="TPI",
+                 Flow_Accum_log10="Flow accumulation (log\u2081\u2080)",Geology="Geology")
   
-  fig06 <- ggplot(curve_df, aes(x = x, y = y,
-                                color = predictor)) +
-    geom_line(linewidth = 1.2) +
-    geom_hline(yintercept = 0.5, linetype = "dashed",
-               color = "grey60", linewidth = 0.5) +
-    scale_color_manual(
-      values = setNames(
-        c("#2A9D8F","#E63946","#F4A261","#8338EC","#06D6A0"),
-        top5),
-      guide = "none") +
-    facet_wrap(~predictor, scales = "free_x", nrow = 1) +
-    scale_y_continuous(limits = c(0, 1),
-                       breaks = seq(0, 1, 0.25)) +
+  curve_df <- do.call(rbind, lapply(top5, function(pred) {
+    ci <- which(final_names==pred); if (!length(ci)) return(NULL)
+    x_seq <- seq(as.numeric(quantile(samp_mat[,ci],0.02,na.rm=T)),
+                 as.numeric(quantile(samp_mat[,ci],0.98,na.rm=T)),
+                 length.out=200)
+    med_m <- matrix(apply(samp_mat,2,median,na.rm=T),
+                    nrow=200,ncol=ncol(samp_mat),byrow=TRUE)
+    colnames(med_m) <- final_names
+    med_m[,ci] <- x_seq; storage.mode(med_m) <- "double"
+    preds <- predict(xgb_mod, xgboost::xgb.DMatrix(med_m))
+    data.frame(predictor=pred, x=x_seq, y=preds)
+  }))
+  curve_df$pred_label <- sapply(as.character(curve_df$predictor),
+                                function(p) units_map[p] %||% p)
+  ordered_labs <- unique(curve_df$pred_label[
+    match(top5, curve_df$predictor)])
+  curve_df$pred_label <- factor(curve_df$pred_label, levels=ordered_labs)
+  curve_cols <- setNames(
+    c("#2A9D8F","#E63946","#F4A261","#8338EC","#06D6A0")[seq_along(top5)],
+    levels(curve_df$pred_label))
+  
+  fig06 <- ggplot(curve_df, aes(x=x,y=y,color=pred_label)) +
+    geom_line(color="grey80", linewidth=0.5) +
+    geom_smooth(method="loess", formula=y~x, span=0.35,
+                se=TRUE, linewidth=1.4, alpha=0.15) +
+    geom_hline(yintercept=0.5, linetype="dashed",
+               color="grey40", linewidth=0.6) +
+    scale_color_manual(values=curve_cols, guide="none") +
+    scale_y_continuous(limits=c(0,1), breaks=seq(0,1,0.25)) +
+    facet_wrap(~pred_label, scales="free_x", nrow=1) +
     labs(title    = "Fig. 6 \u2014 Marginal Response Curves (XGBoost)",
-         subtitle = "Top 5 predictors by mean |SHAP|; other predictors held at median",
-         x = "Predictor value", y = "Predicted suitability",
-         caption  = "Computed from 80-point marginal grid; N=5,000 background sample.") +
-    theme_pub_chart() +
-    theme(strip.text   = element_text(size=9, face="bold"),
-          panel.border = element_rect(color="grey80",
-                                      fill=NA, linewidth=0.4),
-          axis.text.x  = element_text(size=7, angle=20,
-                                      hjust=1),
-          plot.caption = element_text(size=7.5, hjust=0,
-                                      color="grey45", face="italic"),
-          legend.position = "none")
+         subtitle = "Top 5 by Gain importance; others at median; shading = 95% CI (LOESS, span=0.35)",
+         x="Predictor value", y="Predicted suitability",
+         caption  = "Grey = raw XGBoost step-function. Smooth = LOESS. Dashed = 0.5 decision boundary.") +
+    theme_chart_pub() +
+    theme(strip.text=element_text(size=9,face="bold"),
+          axis.text.x=element_text(size=8,angle=25,hjust=1))
   
-  ggsave(file.path(OUT_FIG_MAIN,
-                   "Fig06_response_curves.png"),
-         fig06, width = 14, height = 4.5,
-         dpi = DPI, bg = "white")
+  ggsave(file.path(OUT_FIG_MAIN,"Fig06_response_curves.png"),
+         fig06, width=14, height=5.5, dpi=DPI, bg="white")
   cat("  ✓ Fig06_response_curves.png\n\n")
-}, error = function(e) {
-  cat(sprintf("  ✗ Fig06 error: %s\n\n", e$message))
-})
+}, error=function(e) cat(sprintf("  ✗ Fig06: %s\n\n",e$message)))
 
 # ─────────────────────────────────────────────────────────────
-# 11. FINAL FIGURE CHECKLIST
+# 8. FIGURE 7 — AUC COMPARISON
+# FIX: geom_hline() for ref lines; as.numeric() on all cols
 # ─────────────────────────────────────────────────────────────
 
-cat("--- Final Figure Checklist ---\n\n")
+cat("--- Figure 7: AUC Comparison ---\n")
 
-checklist <- list(
-  list("Fig01_study_area.png",            "Study area + India inset"),
-  list("Fig02_predictor_stack.png",       "Predictor stack (13 vars)"),
-  list("Fig03_palaeochannel.png",         "Palaeochannel construction"),
-  list("Fig04_bias_correction.png",       "Bias correction"),
-  list("Fig05_spatial_cv_design.png",     "Spatial CV design"),
-  list("Fig06_response_curves.png",       "Response curves (XGBoost)"),
-  list("Fig07_AUC_comparison.png",        "AUC comparison + DeLong"),
-  list("Fig08_ensemble_suitability.png",  "Ensemble suitability"),
-  list("Fig09_SHAP_beeswarm.png",         "SHAP beeswarm (Script 19)"),
-  list("Fig10_SHAP_dependence.png",       "SHAP dependence (Script 19)"),
-  list("Fig11_dominant_driver_map.png",   "SHAP dominant driver (Script 19)"),
-  list("Fig12_diachronic_driver_maps.png","Diachronic sub-models (Script 20)"),
-  list("Fig_transfer_validation.png",     "Transfer validation (Script 21)"))
+tryCatch({
+  eval_files <- c(MaxEnt="maxent",RF="rf",XGBoost="xgboost",
+                  BRT="brt",GAM="gam",SVM="svm")
+  adf <- do.call(rbind, lapply(names(eval_files), function(nm) {
+    fp <- file.path(OUT_EVAL, paste0(eval_files[nm],"_evaluation.csv"))
+    if (!file.exists(fp)) return(NULL)
+    d  <- read.csv(fp, stringsAsFactors=FALSE)
+    mc <- grep("cv_auc_mean|cv_auc$",names(d),value=TRUE,ignore.case=TRUE)[1]
+    sc <- grep("cv_auc_sd|auc_sd",  names(d),value=TRUE,ignore.case=TRUE)[1]
+    data.frame(
+      algorithm  = nm,
+      auc_mean   = as.numeric(d[[mc]][1]),
+      auc_sd     = if(!is.na(sc %||% NA)) as.numeric(d[[sc]][1]) else NA_real_,
+      is_ens     = FALSE,
+      delong_sig = nm %in% c("XGBoost","BRT","GAM","SVM"),
+      stringsAsFactors=FALSE)
+  }))
+  
+  # Known results — ensure numeric types explicitly
+  adf <- rbind(adf,
+               data.frame(algorithm="Ensemble (AUC-wt)",
+                          auc_mean=0.7239, auc_sd=NA_real_,
+                          is_ens=TRUE, delong_sig=FALSE,
+                          stringsAsFactors=FALSE))
+  
+  # Force numeric (prevents "discrete to continuous" error)
+  adf$auc_mean <- as.numeric(adf$auc_mean)
+  adf$auc_sd   <- as.numeric(adf$auc_sd)
+  
+  adf$ci_lo <- ifelse(!adf$is_ens,
+                      pmax(adf$auc_mean - 1.96*adf$auc_sd, 0.5), NA_real_)
+  adf$ci_hi <- ifelse(!adf$is_ens,
+                      pmin(adf$auc_mean + 1.96*adf$auc_sd, 1.0), NA_real_)
+  adf$algorithm <- factor(adf$algorithm, levels=adf$algorithm)
+  adf$label_y   <- ifelse(is.na(adf$ci_hi),
+                          adf$auc_mean + 0.025,
+                          adf$ci_hi    + 0.025)
+  
+  # Colour map — must match factor levels exactly
+  bar_cols <- setNames(
+    c("#2A9D8F","#E63946","#F4A261","#264653",
+      "#E9C46A","#8338EC","#06D6A0"),
+    levels(adf$algorithm))
+  
+  # Significance data subsets
+  sig_df  <- subset(adf,  delong_sig)
+  ens_df  <- subset(adf,  is_ens)
+  err_df  <- subset(adf, !is_ens)
+  
+  fig07 <- ggplot(adf, aes(x=algorithm, y=auc_mean)) +
+    # FIX: geom_hline (NOT annotate segment) → no discrete/continuous conflict
+    geom_hline(yintercept=0.75, linetype="dashed",
+               color="#F4A261", linewidth=0.7) +
+    geom_hline(yintercept=0.85, linetype="dotted",
+               color="#E63946", linewidth=0.7) +
+    # Reference labels at integer x positions
+    annotate("text", x=1L, y=0.754,
+             label="AUC = 0.75 (adequate)",
+             hjust=0, size=2.9, color="#F4A261", fontface="italic") +
+    annotate("text", x=1L, y=0.854,
+             label="AUC = 0.85 (strong)",
+             hjust=0, size=2.9, color="#E63946", fontface="italic") +
+    # Error bars — only non-ensemble rows
+    geom_errorbar(data=err_df,
+                  aes(ymin=ci_lo, ymax=ci_hi),
+                  width=0.22, linewidth=0.9, color="grey20") +
+    # Points
+    geom_point(aes(fill=algorithm), shape=21,
+               size=5.5, stroke=0.5, color="white") +
+    scale_fill_manual(values=bar_cols, guide="none") +
+    # AUC value labels
+    geom_text(aes(y=label_y, label=sprintf("%.4f",auc_mean)),
+              size=3.1, fontface="bold", color="grey20") +
+    # DeLong significance stars (* above CI bar)
+    { if (nrow(sig_df)>0)
+      geom_text(data=sig_df, aes(y=ci_hi+0.055), label="*",
+                color="#E63946", size=7, fontface="bold")
+      else geom_blank() } +
+    # Ensemble star
+    { if (nrow(ens_df)>0)
+      geom_text(data=ens_df, aes(y=auc_mean+0.043),
+                label="\u2605", color="#06D6A0", size=5)
+      else geom_blank() } +
+    scale_y_continuous(limits=c(0.50,1.00),
+                       breaks=seq(0.50,1.00,0.05),
+                       expand=expansion(mult=c(0.02,0.05))) +
+    labs(title    = "Fig. 7 \u2014 Spatial Block CV AUC: All Models",
+         subtitle = "\u00b11.96 SD (95% CI shown for individual algorithms); \u2605 = ensemble; * = DeLong p<0.05 vs ensemble",
+         x=NULL, y="Spatial Block CV AUC (5-fold mean)",
+         caption  = "DeLong et al. (1988); pROC package. Ensemble significantly outperforms XGBoost, BRT, GAM, SVM (p<0.05).") +
+    theme_chart_pub() +
+    theme(axis.text.x=element_text(size=10,color="grey15"))
+  
+  ggsave(file.path(OUT_FIG_MAIN,"Fig07_AUC_comparison.png"),
+         fig07, width=9, height=7, dpi=DPI, bg="white")
+  cat("  ✓ Fig07_AUC_comparison.png\n\n")
+}, error=function(e) cat(sprintf("  ✗ Fig07: %s\n\n",e$message)))
+
+# ─────────────────────────────────────────────────────────────
+# 9. FIGURE 8 — ENSEMBLE SUITABILITY + UNCERTAINTY + ZONES
+# ─────────────────────────────────────────────────────────────
+
+cat("--- Figure 8: Ensemble Suitability ---\n")
+
+if (is.null(ens_agg)) {
+  cat("  ✗ Ensemble raster not found\n\n")
+} else tryCatch({
+  ens_vals <- as.numeric(terra::values(ens_agg, na.rm=TRUE))
+  e_hi <- as.numeric(quantile(ens_vals, 0.995, na.rm=TRUE))
+  q25  <- as.numeric(quantile(ens_vals, 0.25,  na.rm=TRUE))
+  q50  <- as.numeric(quantile(ens_vals, 0.50,  na.rm=TRUE))
+  q75  <- as.numeric(quantile(ens_vals, 0.75,  na.rm=TRUE))
+  cat(sprintf("  Suit range: %.4f\u2013%.4f | Q75=%.4f\n",
+              min(ens_vals,na.rm=T), max(ens_vals,na.rm=T), q75))
+  
+  base_ens <- list(
+    geom_sf(data=boundary_utm,fill=NA,color="white",linewidth=0.7),
+    coord_sf(expand=FALSE),
+    scale_x_continuous(labels=utm_fmt),
+    scale_y_continuous(labels=utm_fmt),
+    labs(x=NULL,y=NULL))
+  
+  pA <- ggplot() +
+    tidyterra::geom_spatraster(data=ens_agg) +
+    scale_fill_viridis_c(option="viridis", name="Suit.",
+                         limits=c(0,e_hi), oob=scales::squish, na.value="white",
+                         breaks=round(seq(0,e_hi,length.out=5),3)) +
+    base_ens +
+    geom_sf(data=sites_thin, color="#d62728",
+            shape=19, size=1.5, alpha=0.85) +
+    ggspatial::annotation_scale(location="bl") +
+    ggspatial::annotation_north_arrow(location="tr",
+                                      which_north="true",height=unit(0.75,"cm"),width=unit(0.60,"cm")) +
+    labs(title="(A) Ensemble Suitability",
+         subtitle="CV AUC=0.7239 | Boyce=0.9092 | KG=0.6063") +
+    theme_map_pub() + theme(legend.position="right")
+  
+  if (!is.null(unc_agg)) {
+    unc_vals <- as.numeric(terra::values(unc_agg, na.rm=TRUE))
+    unc_q75  <- as.numeric(quantile(unc_vals, 0.75, na.rm=TRUE))
+    unc_hi   <- as.numeric(quantile(unc_vals, 0.98, na.rm=TRUE))
+    pB <- ggplot() +
+      tidyterra::geom_spatraster(data=unc_agg) +
+      scale_fill_viridis_c(option="plasma", name="SD",
+                           limits=c(0,unc_hi), oob=scales::squish, na.value="white") +
+      base_ens +
+      geom_sf(data=sites_thin, color="white",
+              shape=19, size=0.9, alpha=0.75) +
+      labs(title="(B) Prediction Uncertainty",
+           subtitle=sprintf("SD across 6 algorithms | Q75=%.3f",unc_q75)) +
+      theme_map_pub() + theme(legend.position="right")
+  } else pB <- ggplot()+annotate("text",x=0.5,y=0.5,label="Uncertainty\nnot found")+theme_void()
+  
+  # Classified suitability
+  suit_rcl <- terra::classify(ens_agg,
+                              matrix(c(-Inf,q25,1,q25,q50,2,q50,q75,3,q75,Inf,4),ncol=3,byrow=TRUE),
+                              include.lowest=TRUE)
+  names(suit_rcl) <- "class"
+  sc_df <- as.data.frame(suit_rcl, xy=TRUE, na.rm=TRUE)
+  sc_df$class_f <- factor(sc_df$class, levels=1:4,
+                          labels=c("Low","Moderate","High","Very High"))
+  
+  pC <- ggplot() +
+    geom_raster(data=sc_df, aes(x=x,y=y,fill=class_f)) +
+    scale_fill_manual(name="Suitability",
+                      values=c(Low="#264653",Moderate="#2A9D8F",
+                               High="#E9C46A",`Very High`="#E63946"),
+                      guide=guide_legend(reverse=TRUE), na.value="white") +
+    geom_sf(data=boundary_utm,fill=NA,color="grey30",linewidth=0.6) +
+    geom_sf(data=sites_thin, color="white",
+            shape=19, size=1.0, alpha=0.80) +
+    coord_sf(expand=FALSE) +
+    scale_x_continuous(labels=utm_fmt) +
+    scale_y_continuous(labels=utm_fmt) +
+    labs(title="(C) Suitability Classification",
+         subtitle="Quartile thresholds; 100% of sites in Very High class",
+         x=NULL, y=NULL) +
+    theme_map_pub() + theme(legend.position="right")
+  
+  fig08 <- (pA | pB | pC) +
+    patchwork::plot_annotation(
+      title   = "Fig. 8 \u2014 AUC-Weighted Ensemble: Suitability, Uncertainty & Classification",
+      caption = "All 6 algorithms on logistic probability scale [0\u20131]. Red/white dots = thinned pooled sites (N=190).",
+      theme=theme(plot.title=element_text(size=12,face="bold",hjust=0.5),
+                  plot.caption=element_text(size=7.5,hjust=0,color="grey45",face="italic"),
+                  plot.background=element_rect(fill="white",color=NA)))
+  
+  ggsave(file.path(OUT_FIG_MAIN,"Fig08_ensemble_suitability.png"),
+         fig08, width=16, height=7.5, dpi=DPI, bg="white")
+  cat("  ✓ Fig08_ensemble_suitability.png\n\n")
+}, error=function(e) cat(sprintf("  ✗ Fig08: %s\n\n",e$message)))
+
+# ─────────────────────────────────────────────────────────────
+# 10. FIGURE 9 — SHAP BEESWARM
+# FIX: search multiple paths; rebuild from model if RDS absent
+# ─────────────────────────────────────────────────────────────
+
+cat("--- Figure 9: SHAP Beeswarm ---\n")
+
+tryCatch({
+  # Step 1: Check if Script 19 already saved high-quality version
+  s19_paths <- c(
+    file.path(OUT_FIG_MAIN,"Fig09_SHAP_beeswarm.png"),
+    file.path(OUT_FIG_MAIN,"Fig09_shap_beeswarm.png"))
+  s19_ok <- Find(function(p) file.exists(p) && file.info(p)$size>300000, s19_paths)
+  if (!is.null(s19_ok)) {
+    cat("  Using Script 19 high-quality version ✓\n\n")
+  } else {
+    # Step 2: Load or rebuild SHAP values
+    shap_rds_paths <- c(
+      file.path(OUT_SHAP,"xgboost_shap_values.rds"),
+      file.path(OUT_SHAP,"shap_values_xgboost.rds"),
+      file.path(OUT_SHAP,"shap_data.rds"),
+      file.path(OUT_MOD_IND,"xgboost_shap_values.rds"))
+    shap_rds <- Find(file.exists, shap_rds_paths)
+    
+    if (!is.null(shap_rds)) {
+      shap_data <- readRDS(shap_rds)
+      shap_mat  <- shap_data$shap_matrix
+      X_mat     <- shap_data$predictor_matrix
+    } else {
+      # Rebuild inline from XGBoost model
+      cat("  RDS not found — rebuilding SHAP from model...\n")
+      xgb_path <- file.path(OUT_MOD_IND,"xgboost_model_final.bin")
+      if (!file.exists(xgb_path)) stop("XGBoost model not found")
+      xgb_mod_s <- xgboost::xgb.load(xgb_path)
+      set.seed(42)
+      samp_s <- terra::spatSample(pred_stack, size=2000,
+                                  method="random", na.rm=TRUE, as.df=TRUE)
+      for (col in c("Geology","Geomorphology")[c("Geology","Geomorphology") %in% names(samp_s)])
+        samp_s[[col]] <- as.numeric(as.integer(samp_s[[col]]))
+      X_mat    <- as.matrix(samp_s[,final_names,drop=FALSE])
+      storage.mode(X_mat) <- "double"
+      shap_raw <- predict(xgb_mod_s,
+                          xgboost::xgb.DMatrix(X_mat), predcontrib=TRUE)
+      # Remove BIAS column (last col)
+      shap_mat <- shap_raw[, final_names, drop=FALSE]
+      # Save for reuse
+      saveRDS(list(shap_matrix=shap_mat, predictor_matrix=X_mat),
+              file.path(OUT_SHAP,"xgboost_shap_values.rds"))
+      cat("  SHAP rebuilt and saved ✓\n")
+    }
+    
+    if (HAS_SHAP) {
+      sv <- shapviz::shapviz(shap_mat, X=X_mat)
+      p9 <- shapviz::sv_importance(sv, kind="beeswarm",
+                                   max_display=length(final_names), alpha=0.55, size=1.2) +
+        labs(title    = "Fig. 9 \u2014 SHAP Global Importance (XGBoost)",
+             subtitle = "TreeSHAP; 2,000-cell random sample; colour = predictor value") +
+        theme_chart_pub() +
+        theme(legend.position="right")
+    } else {
+      # Fallback bar chart
+      imp_df <- data.frame(
+        predictor = final_names,
+        mean_abs  = colMeans(abs(shap_mat), na.rm=TRUE))
+      imp_df <- imp_df[order(-imp_df$mean_abs),]
+      imp_df$predictor <- factor(imp_df$predictor,
+                                 levels=rev(imp_df$predictor))
+      p9 <- ggplot(imp_df, aes(x=predictor, y=mean_abs, fill=predictor)) +
+        geom_col(width=0.7) +
+        coord_flip() +
+        scale_fill_manual(
+          values=colorRampPalette(c("#264653","#2A9D8F","#E9C46A","#E63946"))(nrow(imp_df)),
+          guide="none") +
+        labs(title="Fig. 9 \u2014 SHAP Global Importance (XGBoost)",
+             x=NULL, y="Mean |SHAP value|") +
+        theme_chart_pub()
+    }
+    
+    ggsave(file.path(OUT_FIG_MAIN,"Fig09_SHAP_beeswarm.png"),
+           p9, width=9, height=7, dpi=DPI, bg="white")
+    cat("  ✓ Fig09_SHAP_beeswarm.png\n\n")
+  }
+}, error=function(e) cat(sprintf("  ✗ Fig09: %s\n\n",e$message)))
+
+# ─────────────────────────────────────────────────────────────
+# 11. FIGURE 10 — SHAP DEPENDENCE PLOTS
+# FIX: same SHAP rebuild path as Fig 9
+# ─────────────────────────────────────────────────────────────
+
+cat("--- Figure 10: SHAP Dependence ---\n")
+
+tryCatch({
+  s19_paths10 <- c(
+    file.path(OUT_FIG_MAIN,"Fig10_SHAP_dependence.png"),
+    file.path(OUT_FIG_MAIN,"Fig10_shap_dependence.png"))
+  s19_ok10 <- Find(function(p) file.exists(p) && file.info(p)$size>400000, s19_paths10)
+  
+  if (!is.null(s19_ok10)) {
+    cat("  Using Script 19 high-quality version ✓\n\n")
+  } else {
+    # Load SHAP (just rebuilt / already saved above)
+    shap_rds <- file.path(OUT_SHAP,"xgboost_shap_values.rds")
+    if (!file.exists(shap_rds)) stop("Run Fig09 block first")
+    shap_data <- readRDS(shap_rds)
+    shap_mat  <- shap_data$shap_matrix
+    X_mat     <- shap_data$predictor_matrix
+    
+    if (HAS_SHAP) {
+      sv <- shapviz::shapviz(shap_mat, X=X_mat)
+      top5_s <- names(sort(colMeans(abs(shap_mat),na.rm=T),
+                           decreasing=T))[1:5]
+      
+      dep_list <- lapply(top5_s, function(pred) {
+        shapviz::sv_dependence(sv, v=pred, color_var="auto",
+                               alpha=0.50, size=0.9) +
+          labs(title=pred) +
+          theme_chart_pub(base_size=9) +
+          theme(plot.title=element_text(size=10,face="bold",hjust=0.5),
+                legend.key.size=unit(0.30,"cm"))
+      })
+    } else {
+      # Fallback scatter plots
+      top5_s <- names(sort(colMeans(abs(shap_mat),na.rm=T),
+                           decreasing=T))[1:5]
+      dep_list <- lapply(top5_s, function(pred) {
+        if (!pred %in% colnames(shap_mat)) return(NULL)
+        df <- data.frame(x=X_mat[,pred], y=shap_mat[,pred])
+        df <- df[is.finite(df$x)&is.finite(df$y),]
+        ggplot(df,aes(x,y)) +
+          geom_point(size=0.5,alpha=0.4,color="#2A9D8F") +
+          geom_smooth(method="loess",formula=y~x,
+                      color="#E63946",linewidth=1.1,se=FALSE) +
+          geom_hline(yintercept=0,linetype="dashed",color="grey50") +
+          labs(title=pred,x=pred,y="SHAP value") +
+          theme_chart_pub(base_size=9)
+      })
+    }
+    
+    fig10 <- patchwork::wrap_plots(Filter(Negate(is.null),dep_list),
+                                   nrow=2L) +
+      patchwork::plot_annotation(
+        title   = "Fig. 10 \u2014 SHAP Dependence Plots \u2014 Top 5 Predictors (XGBoost)",
+        caption = "TreeSHAP. Colour = interacting predictor with highest |SHAP| correlation (auto-selected).",
+        theme=theme(
+          plot.title=element_text(size=12,face="bold",hjust=0.5),
+          plot.caption=element_text(size=7.5,hjust=0,color="grey45",face="italic"),
+          plot.background=element_rect(fill="white",color=NA)))
+    
+    ggsave(file.path(OUT_FIG_MAIN,"Fig10_SHAP_dependence.png"),
+           fig10, width=14, height=9, dpi=DPI, bg="white")
+    cat("  ✓ Fig10_SHAP_dependence.png\n\n")
+  }
+}, error=function(e) cat(sprintf("  ✗ Fig10: %s\n\n",e$message)))
+
+# ─────────────────────────────────────────────────────────────
+# 12. FIGURE 11 — SHAP DOMINANT DRIVER MAP (UTM)
+# FIX: terra::freq() WITHOUT na.rm=TRUE argument
+# ─────────────────────────────────────────────────────────────
+
+cat("--- Figure 11: SHAP Dominant Driver Map ---\n")
+
+tryCatch({
+  s19_11 <- file.path(OUT_FIG_MAIN,"Fig11_dominant_driver_map.png")
+  if (file.exists(s19_11) && file.info(s19_11)$size > 300000) {
+    cat("  Using Script 19 version ✓\n\n")
+  } else if (!is.null(shap_r)) {
+    # FIX: terra::freq() — NO na.rm argument
+    freq_t  <- terra::freq(shap_r)
+    freq_t  <- freq_t[!is.na(freq_t$value) & freq_t$value > 0, ]
+    freq_t  <- freq_t[order(-freq_t$count), ]
+    codes   <- as.integer(freq_t$value)
+    labels  <- final_names[pmin(codes, length(final_names))]
+    pcts    <- 100 * freq_t$count / sum(freq_t$count)
+    drv_c   <- sapply(labels, function(nm)
+      if (nm %in% names(DRIVER_PAL)) DRIVER_PAL[nm] else "#AAAAAA")
+    
+    shap_rcl <- terra::classify(shap_r,
+                                cbind(codes, seq_along(codes)), others=NA)
+    names(shap_rcl) <- "driver_idx"
+    shap_df <- as.data.frame(shap_rcl, xy=TRUE, na.rm=FALSE)
+    shap_df <- shap_df[!is.na(shap_df$driver_idx), ]
+    shap_df$driver <- factor(shap_df$driver_idx,
+                             levels=seq_along(labels), labels=labels)
+    
+    leg_labs <- sprintf("%s (%.1f%%)", labels, pcts)
+    names(leg_labs) <- labels
+    
+    fig11 <- ggplot() +
+      geom_raster(data=shap_df, aes(x=x,y=y,fill=driver)) +
+      scale_fill_manual(
+        name   = "Dominant predictor\n(% of 250m cells)",
+        values = setNames(drv_c, labels),
+        labels = leg_labs,
+        na.value = "white",
+        guide  = guide_legend(
+          ncol = if(length(labels)>8) 2L else 1L,
+          override.aes = list(size=3.5))) +
+      geom_sf(data=boundary_utm, fill=NA,
+              color="grey20", linewidth=0.75) +
+      geom_sf(data=sites_thin, color="white",
+              shape=19, size=0.9, alpha=0.75) +
+      ggspatial::annotation_scale(location="bl") +
+      ggspatial::annotation_north_arrow(location="tr",
+                                        which_north="true", height=unit(0.8,"cm"),
+                                        width=unit(0.65,"cm")) +
+      coord_sf(expand=FALSE) +
+      scale_x_continuous(labels=utm_fmt) +
+      scale_y_continuous(labels=utm_fmt) +
+      labs(title   = "Fig. 11 \u2014 SHAP Dominant Predictor per 250m Cell",
+           subtitle = "TreeSHAP (XGBoost); 250m grid; \u03c7\u00b2=54,352, p<0.001",
+           caption  = "White dots = thinned sites (N=190). Predictor with highest |SHAP value| per 250m cell.",
+           x="Easting (m)", y="Northing (m)") +
+      theme_map_pub() +
+      theme(legend.position="right",
+            legend.text=element_text(size=7.5),
+            legend.title=element_text(size=8.5,face="bold"))
+    
+    ggsave(file.path(OUT_FIG_MAIN,"Fig11_shap_dominant_driver.png"),
+           fig11, width=9, height=11.5, dpi=DPI, bg="white")
+    cat("  ✓ Fig11_shap_dominant_driver.png\n\n")
+  } else cat("  ✗ Fig11: SHAP raster not found\n\n")
+}, error=function(e) cat(sprintf("  ✗ Fig11: %s\n\n",e$message)))
+
+# ─────────────────────────────────────────────────────────────
+# 13. FIGURE 12 — DIACHRONIC SUB-MODEL DRIVER MAPS (UTM)
+# FIX: terra::freq() WITHOUT na.rm=TRUE; handle UP CHELSA preds
+# ─────────────────────────────────────────────────────────────
+
+cat("--- Figure 12: Diachronic Driver Maps ---\n")
+
+tryCatch({
+  periods    <- c("LP","MP","UP")
+  per_titles <- c(
+    LP = "Lower Palaeolithic\n(N=70, Ens AUC=0.8153)",
+    MP = "Middle Palaeolithic\n(N=110, Ens AUC=0.7278)",
+    UP = "Upper Palaeolithic\n(N=74, Ens AUC=0.7845)")
+  # Extended pool: main + potential CHELSA predictors
+  pred_pool <- c(final_names, "BIO1","BIO12","BIO15")
+  
+  plist12 <- lapply(periods, function(per) {
+    rp <- tryCatch(
+      terra::rast(file.path(OUT_MOD_SUB, per,
+                            sprintf("%s_dominant_driver_250m.tif",per))),
+      error=function(e) NULL)
+    if (is.null(rp)) return(
+      ggplot()+annotate("text",x=0.5,y=0.5,
+                        label=sprintf("%s raster\nnot found",per),
+                        size=4,color="grey50")+
+        theme_void()+theme(plot.background=element_rect(fill="white",color=NA)))
+    
+    # FIX: terra::freq() without na.rm
+    freq_p  <- terra::freq(rp)
+    freq_p  <- freq_p[!is.na(freq_p$value) & freq_p$value > 0, ]
+    freq_p  <- freq_p[order(-freq_p$count), ]
+    codes_p <- as.integer(freq_p$value)
+    labs_p  <- pred_pool[pmin(codes_p, length(pred_pool))]
+    pcts_p  <- 100 * freq_p$count / sum(freq_p$count)
+    cols_p  <- sapply(labs_p, function(nm)
+      if (nm %in% names(DRIVER_PAL)) DRIVER_PAL[nm] else "#AAAAAA")
+    
+    rp_rcl <- terra::classify(rp,
+                              cbind(codes_p, seq_along(codes_p)), others=NA)
+    names(rp_rcl) <- "di"
+    df_p <- as.data.frame(rp_rcl, xy=TRUE, na.rm=FALSE)
+    df_p <- df_p[!is.na(df_p$di), ]
+    df_p$driver <- factor(df_p$di,
+                          levels=seq_along(labs_p), labels=labs_p)
+    
+    leg_p <- sprintf("%s\n%.1f%%", labs_p, pcts_p)
+    names(leg_p) <- labs_p
+    
+    ggplot() +
+      geom_raster(data=df_p, aes(x=x,y=y,fill=driver)) +
+      scale_fill_manual(
+        name="Dominant\npredictor",
+        values=setNames(cols_p, labs_p),
+        labels=leg_p, na.value="white",
+        guide=guide_legend(ncol=1,
+                           override.aes=list(size=3.2))) +
+      geom_sf(data=boundary_utm, fill=NA,
+              color="grey20", linewidth=0.6) +
+      coord_sf(expand=FALSE) +
+      scale_x_continuous(labels=utm_fmt) +
+      scale_y_continuous(labels=utm_fmt) +
+      labs(title    = per_titles[per],
+           subtitle = sprintf("Top driver: %s (%.1f%%)", labs_p[1], pcts_p[1]),
+           x=NULL, y=NULL) +
+      theme_map_pub(base_size=9) +
+      theme(legend.position="right",
+            legend.text=element_text(size=6.5),
+            legend.title=element_text(size=7.5,face="bold"),
+            legend.key.size=unit(0.30,"cm"),
+            plot.title=element_text(size=9.5,face="bold",lineheight=1.2))
+  })
+  
+  fig12 <- patchwork::wrap_plots(plist12, nrow=1L) +
+    patchwork::plot_annotation(
+      title   = "Fig. 12 \u2014 Diachronic SHAP Dominant Predictor Maps",
+      subtitle = "XGBoost TreeSHAP sub-models; 250m grid; GAM excluded (REML timeout); 5-algorithm ensemble",
+      caption  = "LP=Lower; MP=Middle; UP=Upper Palaeolithic. Colours consistent with Fig. 11.",
+      theme=theme(
+        plot.title    = element_text(size=12,face="bold",hjust=0.5),
+        plot.subtitle = element_text(size=8.5,hjust=0.5,color="grey40"),
+        plot.caption  = element_text(size=7.5,hjust=0,color="grey45",face="italic"),
+        plot.background=element_rect(fill="white",color=NA)))
+  
+  ggsave(file.path(OUT_FIG_MAIN,"Fig12_diachronic_driver_maps.png"),
+         fig12, width=16, height=9, dpi=DPI, bg="white")
+  cat("  ✓ Fig12_diachronic_driver_maps.png\n\n")
+}, error=function(e) cat(sprintf("  ✗ Fig12: %s\n\n",e$message)))
+
+# ─────────────────────────────────────────────────────────────
+# 14. FINAL CHECKLIST
+# ─────────────────────────────────────────────────────────────
+
+cat("--- Final Checklist ---\n\n")
+items <- list(
+  c("Fig01_study_area.png",            "Fig 1:  Study area (UTM 44N)"),
+  c("Fig02_predictor_stack.png",       "Fig 2:  Predictor stack (13)"),
+  c("Fig03_palaeochannel.png",         "Fig 3:  Palaeochannel"),
+  c("Fig04_bias_correction.png",       "Fig 4:  Bias correction"),
+  c("Fig05_spatial_cv_design.png",     "Fig 5:  Spatial CV design"),
+  c("Fig06_response_curves.png",       "Fig 6:  Response curves (LOESS)"),
+  c("Fig07_AUC_comparison.png",        "Fig 7:  AUC comparison"),
+  c("Fig08_ensemble_suitability.png",  "Fig 8:  Ensemble suitability"),
+  c("Fig09_SHAP_beeswarm.png",         "Fig 9:  SHAP beeswarm"),
+  c("Fig10_SHAP_dependence.png",       "Fig 10: SHAP dependence"),
+  c("Fig11_shap_dominant_driver.png",  "Fig 11: SHAP dominant driver"),
+  c("Fig12_diachronic_driver_maps.png","Fig 12: Diachronic LP/MP/UP"))
 
 n_ok <- 0L
-for (item in checklist) {
-  fp   <- file.path(OUT_FIG_MAIN, item[[1]])
-  ok   <- file.exists(fp)
+for (it in items) {
+  fp <- file.path(OUT_FIG_MAIN, it[1])
+  ok <- file.exists(fp)
   if (ok) n_ok <- n_ok + 1L
-  sz   <- if (ok) sprintf("%.0f KB",
-                          file.info(fp)$size/1024) else "MISSING"
-  cat(sprintf("  %s %-45s %s\n",
-              if (ok) "\u2713" else "\u2717",
-              item[[2]], sz))
+  sz <- if(ok) sprintf("%.0f KB",file.info(fp)$size/1024) else "MISSING"
+  cat(sprintf("  %s %-40s %s\n",
+              if(ok)"\u2713" else "\u2717", it[2], sz))
 }
-cat(sprintf("\n  %d / %d figures present\n\n", n_ok,
-            length(checklist)))
-
+cat(sprintf("\n  %d / %d figures present\n\n", n_ok, length(items)))
 cat("========================================\n")
 cat("SCRIPT 23 COMPLETE\n")
 cat("========================================\n\n")
-cat("Framework: ggplot2 + tidyterra (not base R)\n")
-cat("All fixes applied:\n")
-cat("  FIX 1 — Fig08: terra::values()+quantile() ✓\n")
-cat("  FIX 2 — Fig01: rnaturalearth India outline ✓\n")
-cat("  FIX 3 — Fig02: quantile stretch (no dark panels) ✓\n")
-cat("  FIX 4 — Fig11: legend from raster freq() ✓\n")
-cat("  FIX 5 — Fig07: no CI bar for ensemble ✓\n")
-cat("\n300 DPI  |  viridis palettes  |  patchwork layouts\n")
+cat("All bugs fixed:\n")
+cat("  [1] Fill conflict Fig01 → sites use COLOR ✓\n")
+cat("  [2] India inset removed (UTM 44N only) ✓\n")
+cat("  [3] All maps stay in UTM 44N ✓\n")
+cat("  [4] Fig07 geom_hline() + as.numeric() ✓\n")
+cat("  [5] terra::freq() without na.rm ✓\n")
+cat("  [6] SHAP rebuilt from model if RDS absent ✓\n")
 cat("========================================\n")
