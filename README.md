@@ -200,7 +200,7 @@ source("scripts/25_tables_export.R")
 
 All environmental predictor rasters, processed site coordinates, model prediction surfaces, SHAP rasters, and evaluation outputs are openly available at:
 
-**Zenodo DOI:** [INSERT AT SUBMISSION]
+**Zenodo DOI:** https://doi.org/10.5281/zenodo.20826093
 
 **Raw data sources:**
 
