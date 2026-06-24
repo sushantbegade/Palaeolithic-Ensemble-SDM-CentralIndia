@@ -2,13 +2,13 @@
 
 **Paper:** A Multi-Model Ensemble Framework with Spatial Explainability for Predicting Open-Air Palaeolithic Site Distribution in Central India: Bias Correction, Algorithmic Diversity, and Spatially Heterogeneous Predictor Importance
 
-**Authors:** Sushant Begade¹ and Prabash Sahu¹
+**Authors:** Sushant Begade*¹ and Prabash Sahu¹
 
 **Affiliation:** ¹ Department of Ancient Indian History, Culture and Archaeology, Rashtrasant Tukadoji Maharaj Nagpur University, Nagpur – 440033, India
 
 **ORCIDs:** Sushant Begade: [0009-0003-0804-1763](https://orcid.org/0009-0003-0804-1763) | Prabash Sahu: [0000-0003-0691-0403](https://orcid.org/0000-0003-0691-0403)
 
-**Target Journal:** Journal of Archaeological Science (Q1, IF ~4.4)
+**Target Journal:** Journal of Archaeological Science 
 
 **Status:** Under Review
 
