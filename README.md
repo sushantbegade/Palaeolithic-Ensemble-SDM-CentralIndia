@@ -90,7 +90,7 @@ Palaeolithic-Ensemble-SDM-CentralIndia/
 │   ├── 24_figures_supplementary.R
 │   └── 25_tables_export.R
 ├── renv.lock
-├── Nagpur_Chandrapur_Ensemble.Rproj
+├── Nagpur_Chandrapur_Ensemble.Rproj (Create this file using RStudio)
 └── README.md
 ```
 
