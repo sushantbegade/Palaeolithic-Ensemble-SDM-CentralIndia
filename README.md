@@ -160,10 +160,10 @@ These fixes were applied during analysis and are documented in scripts 16b and 1
 | 7 | Flow Accumulation (log10) | Continuous | D8 algorithm | 1.25 |
 | 8 | Distance to Perennial River | Continuous | SOI 1:50,000 | 1.05 |
 | 9 | Distance to Palaeochannel | Continuous | MNDWI ∩ DEM valley | 1.02 |
-| 10 | Distance to Raw Material Source | Continuous | GSI Bhukosh + field GPS | 1.04 |
+| 10 | Distance to Raw Material Source | Continuous | NGDR + field GPS | 1.04 |
 | 11 | NDVI (dry season) | Continuous | Sentinel-2A May 2025 | 1.05 |
-| 12 | Geology | Categorical | GSI Bhukosh 1:50,000 | — |
-| 13 | Geomorphology | Categorical | GSI Bhukosh 1:50,000 | — |
+| 12 | Geology | Categorical | NGDR 1:50,000 | — |
+| 13 | Geomorphology | Categorical | NGDR 1:50,000 | — |
 
 *Slope excluded: VIF=74.82 (collinear with TRI). TRI retained as mechanistically more informative.
 
