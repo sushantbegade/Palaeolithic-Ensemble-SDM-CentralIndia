@@ -206,10 +206,10 @@ All environmental predictor rasters, processed site coordinates, model predictio
 
 | Dataset | Portal |
 |---|---|
-| Geological, Geomorphological, Lithological data | [GSI Bhukosh](https://bhukosh.gsi.gov.in) |
+| Geological, Geomorphological, Lithological data | [National Geoscience Data Repository (NGDR)](https://geodataindia.gov.in) |
 | River and Waterbody data | [India-WRIS](https://indiawris.gov.in) |
-| Cartosat-1 CartoDEM 30m | [Bhuvan NRSC](https://bhoonidhi.nrsc.gov.in) |
-| Sentinel-2A Level-2A imagery | [Copernicus Data Space](https://dataspace.copernicus.eu) |
+| Cartosat-1 CartoDEM 30m | [Bhoonidhi](https://bhoonidhi.nrsc.gov.in) |
+| Sentinel-2A Level-2A imagery | [Bhoonidhi](https://bhoonidhi.nrsc.gov.in) |
 | CHELSA-TraCE21k palaeoclimate | [CHELSA](https://chelsa-climate.org/chelsa-trace21k/) |
 
 > Raw GPS field data are available from the corresponding author upon reasonable request, subject to site confidentiality constraints.
@@ -234,7 +234,7 @@ Attribution sensitivity: LP rankings STABLE across confirmed-only vs confirmed+p
 
 This ensemble paper is the direct methodological successor to:
 
-> Begade, S., 2026. A predictive model for the identification of open-air Palaeolithic sites in Nagpur and Chandrapur Districts, Maharashtra, India: a MaxEnt-based approach. *Journal of Archaeological Science: Reports* 62, 104948. https://doi.org/10.1016/j.jasrep.2025.104948
+>	Begade, S. 2026. A Predictive Model for the Identification of Open-Air Palaeolithic Sites in Nagpur and Chandrapur Districts, Maharashtra, India. Journal of Archaeological Science: Reports, 69, 105541. https://doi.org/10.1016/j.jasrep.2025.105541
 
 ---
 
