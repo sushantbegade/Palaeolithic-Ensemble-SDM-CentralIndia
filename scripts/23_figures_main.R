@@ -1,5 +1,12 @@
 # ============================================================
-# SCRIPT 23: ALL 12 MAIN FIGURES — DEFINITIVE BUG-FIXED VERSION
+# SCRIPT 23: ALL 12 MAIN FIGURES — BUG-FIXED
+# ============================================================
+# Paper: A Multi-Model Ensemble Framework with Spatial
+#        Explainability for Predicting Open-Air Palaeolithic
+#        Site Distribution in Central India
+# Author: Sushant Begade* and Prabash Sahu
+# ORCID:  0009-0003-0804-1763; 0000-0003-0691-0403
+# Script: 23 of 25
 # ============================================================
 # Fixes applied vs previous version:
 #  [1] Fig01 fill conflict (DEM continuous + sites discrete)

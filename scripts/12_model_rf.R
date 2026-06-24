@@ -4,9 +4,8 @@
 # Paper: A Multi-Model Ensemble Framework with Spatial
 #        Explainability for Predicting Open-Air Palaeolithic
 #        Site Distribution in Central India
-# Author: Sushant Begade | RTMNU Nagpur
-# ORCID:  0009-0003-0804-1763
-# Date:   June 2026
+# Author: Sushant Begade* and Prabash Sahu
+# ORCID:  0009-0003-0804-1763; 0000-0003-0691-0403
 # Script: 12 of 25
 # ============================================================
 # PARAMETERS (Research Design 5.7.2):

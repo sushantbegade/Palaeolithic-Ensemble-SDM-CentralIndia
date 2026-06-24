@@ -1,6 +1,14 @@
 # ============================================================
 # SCRIPT 16b PART 2: Fix Dist_RawMat with selective keywords
 # ============================================================
+# Paper: A Multi-Model Ensemble Framework with Spatial
+#        Explainability for Predicting Open-Air Palaeolithic
+#        Site Distribution in Central India
+# Author: Sushant Begade* and Prabash Sahu
+# ORCID:  0009-0003-0804-1763; 0000-0003-0691-0403
+# Script: 16b2 of 25 (inserted — not in original plan)
+# ============================================================
+# WHAT THIS SCRIPT DOES:
 # FIELD: lithologic (42 values — confirmed correct)
 # STRATEGY: restrict to HIGH-QUALITY knappable rocks only
 # JUSTIFICATION: Palaeolithic raw material selection was
