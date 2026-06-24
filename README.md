@@ -182,7 +182,7 @@ These fixes were applied during analysis and are documented in scripts 16b and 1
 renv::restore()
 
 # 4. Download data from Zenodo
-# Zenodo DOI: [INSERT AT SUBMISSION]
+# Zenodo DOI: https://doi.org/10.5281/zenodo.20825880
 # Place in data_raw/ directory as specified in Script 02
 
 # 5. Run scripts in order
